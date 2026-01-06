@@ -140,14 +140,77 @@ def fetch_eia_series(series_id: str, api_key: str) -> pd.DataFrame:
     return df
 
 
-def compute_weekly_change(storage_df: pd.DataFrame) -> pd.DataFrame:
+def project_next_week_storage(stor: pd.DataFrame) -> dict:
     """
-    Adds weekly injection/withdrawal (difference) column.
-    Positive = injection, Negative = withdrawal.
+    Simple projection for next week's storage:
+    - Recent trend: average of last 4 weekly changes
+    - Seasonal: median weekly change for same ISO week in prior years (up to 5 years)
+    Projection = 70% recent + 30% seasonal (if seasonal available)
     """
-    df = storage_df.copy().sort_values("date")
-    df["weekly_change"] = df["value"].diff()
-    return df
+    if stor is None or stor.empty or "value" not in stor.columns:
+        return {"ok": False, "reason": "No storage data"}
+
+    s = stor.dropna(subset=["value"]).sort_values("date").copy()
+    if len(s) < 3:
+        return {"ok": False, "reason": "Not enough history"}
+
+    # Ensure weekly_change exists
+    if "weekly_change" not in s.columns:
+        s["weekly_change"] = s["value"].diff()
+
+    last_row = s.iloc[-1]
+    last_date = pd.to_datetime(last_row["date"])
+    last_storage = float(last_row["value"])
+
+    # Recent avg (last 4 changes)
+    recent = s["weekly_change"].dropna().tail(4)
+    recent_avg = float(recent.mean()) if len(recent) else float("nan")
+
+    # Seasonal median for next week's ISO week
+    next_date = last_date + pd.Timedelta(days=7)
+    iso_week = int(next_date.isocalendar().week)
+    iso_year = int(next_date.isocalendar().year)
+
+    s2 = s.copy()
+    iso = s2["date"].dt.isocalendar()
+    s2["iso_week"] = iso.week.astype(int)
+    s2["iso_year"] = iso.year.astype(int)
+
+    seasonal_pool = s2[(s2["iso_week"] == iso_week) & (s2["iso_year"] < iso_year)]
+    # keep last ~5 years
+    seasonal_pool = seasonal_pool.sort_values("date").tail(5 * 1)  # ~5 samples (weekly)
+    seasonal_vals = seasonal_pool["weekly_change"].dropna()
+
+    seasonal_median = float(seasonal_vals.median()) if len(seasonal_vals) else float("nan")
+
+    # Blend
+    if pd.isna(seasonal_median) and pd.isna(recent_avg):
+        return {"ok": False, "reason": "Cannot compute projection"}
+
+    if pd.isna(seasonal_median):
+        proj_change = recent_avg
+        method = "Recent 4-week avg"
+    elif pd.isna(recent_avg):
+        proj_change = seasonal_median
+        method = "Seasonal median"
+    else:
+        proj_change = 0.7 * recent_avg + 0.3 * seasonal_median
+        method = "70% recent + 30% seasonal"
+
+    proj_storage = last_storage + proj_change
+    direction = "Injection" if proj_change > 0 else "Withdrawal" if proj_change < 0 else "Flat"
+
+    return {
+        "ok": True,
+        "last_date": last_date,
+        "next_date": next_date,
+        "last_storage": last_storage,
+        "proj_change": float(proj_change),
+        "proj_storage": float(proj_storage),
+        "direction": direction,
+        "method": method,
+    }
+
 
 
 # -----------------------------
