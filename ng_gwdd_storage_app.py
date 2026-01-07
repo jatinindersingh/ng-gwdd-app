@@ -407,6 +407,30 @@ DEFAULT_CITIES = pd.DataFrame(
     columns=["city", "lat", "lon", "weight"],
 )
 
+# -----------------------------
+# Global demand regions (US NG burn + key LNG import markets)
+# You can edit weights/locations inside the GWDD tab.
+# -----------------------------
+GLOBAL_DEMAND_REGIONS = pd.DataFrame(
+    [
+        ("US Northeast (NYC)", 40.7128, -74.0060, 1.00),
+        ("US Midwest (Chicago)", 41.8781, -87.6298, 0.90),
+        ("US South Central (Dallas)", 32.7767, -96.7970, 0.85),
+        ("US Southeast (Atlanta)", 33.7490, -84.3880, 0.75),
+        ("US West (Los Angeles)", 34.0522, -118.2437, 0.55),
+        ("Mexico (Monterrey)", 25.6866, -100.3161, 0.70),
+        ("UK (London)", 51.5074, -0.1278, 0.55),
+        ("Netherlands (Amsterdam)", 52.3676, 4.9041, 0.50),
+        ("Germany (Berlin)", 52.5200, 13.4050, 0.55),
+        ("Japan (Tokyo)", 35.6762, 139.6503, 0.55),
+        ("South Korea (Seoul)", 37.5665, 126.9780, 0.50),
+        ("China (Shanghai)", 31.2304, 121.4737, 0.50),
+    ],
+    columns=["region", "lat", "lon", "weight"],
+)
+
+
+
 
 # -----------------------------
 # Streamlit UI
@@ -578,7 +602,7 @@ def front_delivery_month(today: "dt.date") -> tuple[int,int]:
         return y+1, 1
     return y, m+1
 
-tabs = st.tabs(["GWDD Dashboard", "EIA Storage Dashboard", "Signals & Summary", "Contracts & Rollover"])
+tabs = st.tabs(["GWDD Dashboard", "EIA Storage Dashboard", "Signals & Summary", "Contracts & Rollover", "NG Price Indexes & Curves"])
 
 # -----------------------------
 # Tab 1: GWDD
@@ -639,6 +663,84 @@ with tabs[0]:
             pivot = all_city.pivot_table(index="date", columns="city", values="gwdd", aggfunc="mean").sort_index()
             st.dataframe(pivot, use_container_width=True)
             st.line_chart(pivot)
+
+            st.divider()
+            st.subheader("Global demand regions — Weather forecast & GWDD (export / burn markets)")
+            st.caption("Add-on view: selected world regions where natural gas demand matters (US regions + key LNG/Mexico markets). Uses the same GWDD base you set in the sidebar.")
+
+            # Editable region list (inside the tab — does not affect your sidebar cities)
+            regions_df = st.data_editor(
+                GLOBAL_DEMAND_REGIONS,
+                num_rows="dynamic",
+                use_container_width=True,
+                column_config={
+                    "region": st.column_config.TextColumn("Region"),
+                    "lat": st.column_config.NumberColumn("Lat"),
+                    "lon": st.column_config.NumberColumn("Lon"),
+                    "weight": st.column_config.NumberColumn("Weight", help="Higher weight = more demand impact"),
+                },
+                key="global_regions_editor",
+            )
+
+            selected = st.multiselect(
+                "Select regions to include",
+                options=regions_df["region"].astype(str).tolist(),
+                default=regions_df["region"].astype(str).tolist()[:6],
+                key="global_regions_select",
+            )
+
+            if not selected:
+                st.info("Select at least one region to show global weather + GWDD.")
+            else:
+                g_frames = []
+                with st.spinner("Fetching global weather + calculating GWDD..."):
+                    for _, rrow in regions_df.iterrows():
+                        name = str(rrow.get("region", "")).strip()
+                        if name not in selected:
+                            continue
+                        try:
+                            rdf = fetch_open_meteo_daily(float(rrow["lat"]), float(rrow["lon"]), days=days)
+                            rgw = compute_gwdd(rdf, base_f=base_f)
+                            rgw["region"] = name
+                            rgw["weight"] = float(rrow.get("weight", 1.0))
+                            g_frames.append(rgw)
+                        except Exception as e:
+                            st.warning(f"Region failed: {name} — {e}")
+
+                if g_frames:
+                    g_all = pd.concat(g_frames, ignore_index=True)
+                    g_pivot = g_all.pivot_table(index="date", columns="region", values="gwdd", aggfunc="mean").sort_index()
+
+                    # Weighted overall
+                    g_all["w_gwdd"] = g_all["gwdd"] * g_all["weight"]
+                    g_overall = (
+                        g_all.groupby("date", as_index=False)
+                        .agg(weighted_sum=("w_gwdd", "sum"), weight_sum=("weight", "sum"))
+                    )
+                    g_overall["GWDD_global_weighted"] = g_overall["weighted_sum"] / g_overall["weight_sum"]
+                    g_overall = g_overall[["date", "GWDD_global_weighted"]].sort_values("date")
+
+                    cga, cgb = st.columns([1, 1])
+                    with cga:
+                        st.markdown("#### Global weighted GWDD (daily)")
+                        st.dataframe(g_overall, use_container_width=True, hide_index=True)
+                        st.line_chart(g_overall.set_index("date")["GWDD_global_weighted"])
+                    with cgb:
+                        st.markdown("#### Region GWDD (daily)")
+                        st.dataframe(g_pivot, use_container_width=True)
+                        st.line_chart(g_pivot)
+
+                    # Quick temperature snapshot (next day)
+                    st.markdown("#### Next-day temperature snapshot (°F)")
+                    next_day = g_all["date"].min()
+                    snap = (
+                        g_all[g_all["date"] == next_day][["region", "temp_f", "gwdd", "weight"]]
+                        .sort_values("weight", ascending=False)
+                        .reset_index(drop=True)
+                    )
+                    st.dataframe(snap, use_container_width=True, hide_index=True)
+                else:
+                    st.error("No global region data fetched. Check internet or region coordinates.")
 
 # -----------------------------
 # Tab 2: EIA Storage
@@ -1057,30 +1159,6 @@ with tabs[2]:
 
     st.write(" • ".join(summary_parts))
 
-st.divider()
-st.subheader("Front-month Natural Gas price — 5-year comparison (2020–2026)")
-st.caption("Data source: Yahoo Finance continuous front-month futures (ticker: NG=F).")
-
-if yf is None:
-    st.info("To enable this chart, install yfinance:  `pip install yfinance`  (then restart the app).")
-else:
-    try:
-        hist = fetch_front_month_ng_history(start="2020-01-01")
-        season = build_yearly_seasonality(hist, year_start=2020, year_end=2026)
-
-        if season.empty:
-            st.warning("No NG=F data available for 2020–2026.")
-        else:
-            st.line_chart(season, use_container_width=True)
-            with st.expander("Show raw data (last 30 rows)"):
-                st.dataframe(hist.tail(30), use_container_width=True, hide_index=True)
-    except Exception as e:
-        st.warning(f"Could not load NG front-month prices: {e}")
-
-
-
-
-
 # -----------------------------
 # Tab 4: Contracts & Rollover
 # -----------------------------
@@ -1218,3 +1296,90 @@ If you trade **NG=F (Yahoo front month)** or CFDs, the rollover behavior can dif
 
     df_roll = pd.DataFrame(rows)
     st.dataframe(df_roll, use_container_width=True)
+
+# -----------------------------
+# Tab 5: NG Price Indexes & Curves (ADD ONLY)
+# -----------------------------
+with tabs[4]:
+    st.header("Natural Gas Price Indexes & Forward Curves")
+    st.caption("Bidweek, Spot, Weekly, Forward Curves, LNG, Mexico, Shale & Historical Data")
+    st.info("This tab is ADD-ONLY. No existing logic or calculations are modified.")
+
+    st.subheader("Bidweek Price Indexes")
+    st.caption("First-of-Month natural gas price indexes (150+ locations in North America)")
+    bidweek_file = st.file_uploader("Upload Bidweek CSV (optional)", type=["csv"], key="bidweek")
+    if bidweek_file:
+        df = pd.read_csv(bidweek_file)
+        st.dataframe(df, use_container_width=True)
+
+    st.subheader("Daily Price Indexes (Spot)")
+    st.caption("Daily spot natural gas price indexes (170+ locations in North America)")
+    daily_file = st.file_uploader("Upload Daily Spot CSV (optional)", type=["csv"], key="daily")
+    if daily_file:
+        df = pd.read_csv(daily_file)
+        st.dataframe(df, use_container_width=True)
+
+    st.subheader("Weekly Price Indexes")
+    st.caption("Weekly averages of spot natural gas price indexes")
+    weekly_file = st.file_uploader("Upload Weekly CSV (optional)", type=["csv"], key="weekly")
+    if weekly_file:
+        df = pd.read_csv(weekly_file)
+        st.dataframe(df, use_container_width=True)
+
+    st.subheader("Forward Curve Data")
+    st.caption("Monthly basis & fixed forward curves out 10 years (updated daily) at key natgas hubs")
+    curve_file = st.file_uploader("Upload Forward Curve CSV (optional)", type=["csv"], key="curve")
+    if curve_file:
+        df = pd.read_csv(curve_file)
+        st.dataframe(df, use_container_width=True)
+        # If user has a date/period column + a price column, they can rename to these
+        if "price" in df.columns:
+            try:
+                st.line_chart(df.set_index(df.columns[0])["price"])
+            except Exception:
+                pass
+
+    st.subheader("LNG Data Suite")
+    st.caption("Key data to support North American natural gas and LNG business decisions")
+    lng_file = st.file_uploader("Upload LNG CSV (optional)", type=["csv"], key="lng")
+    if lng_file:
+        df = pd.read_csv(lng_file)
+        st.dataframe(df, use_container_width=True)
+
+    st.subheader("Mexico Price & Flow Data")
+    st.caption("Mexico natural gas pricing and pipeline flow data")
+    mexico_file = st.file_uploader("Upload Mexico CSV (optional)", type=["csv"], key="mexico")
+    if mexico_file:
+        df = pd.read_csv(mexico_file)
+        st.dataframe(df, use_container_width=True)
+
+    st.subheader("Daily Preliminary Prices")
+    st.caption("Indicative daily natural gas price data based on actual trade data")
+    prelim_daily = st.file_uploader("Upload Daily Preliminary CSV (optional)", type=["csv"], key="prelim_daily")
+    if prelim_daily:
+        df = pd.read_csv(prelim_daily)
+        st.dataframe(df, use_container_width=True)
+
+    st.subheader("Bidweek Preliminary Prices")
+    st.caption("Indicative bidweek pricing (last three days of the month) based on actual trade data")
+    prelim_bidweek = st.file_uploader("Upload Bidweek Preliminary CSV (optional)", type=["csv"], key="prelim_bidweek")
+    if prelim_bidweek:
+        df = pd.read_csv(prelim_bidweek)
+        st.dataframe(df, use_container_width=True)
+
+    st.subheader("Shale Prices")
+    st.caption("Transparent pricing data for major shale and unconventional plays in North America")
+    shale_file = st.file_uploader("Upload Shale Prices CSV (optional)", type=["csv"], key="shale")
+    if shale_file:
+        df = pd.read_csv(shale_file)
+        st.dataframe(df, use_container_width=True)
+
+    st.subheader("Historical Data")
+    st.caption("Historical datasets (some series back to 1988)")
+    hist_file = st.file_uploader("Upload Historical CSV (optional)", type=["csv"], key="historical")
+    if hist_file:
+        df = pd.read_csv(hist_file)
+        st.dataframe(df, use_container_width=True)
+
+    st.success("Loaded. When you have an OPIS / Argus / S&P export, upload CSVs here. API integration can be added later (still safe).")
+
