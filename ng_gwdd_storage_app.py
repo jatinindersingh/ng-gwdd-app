@@ -14,6 +14,12 @@ import requests
 import streamlit as st
 import numpy as np
 
+# Optional market data (front-month NG)
+try:
+    import yfinance as yf
+except Exception:
+    yf = None
+
 
 # -----------------------------
 # Helpers
@@ -110,6 +116,108 @@ def safe_float(x):
     except Exception:
         return float("nan")
 
+
+
+
+# -----------------------------
+# Front-month Natural Gas price (Yahoo: NG=F)
+# -----------------------------
+@st.cache_data(ttl=60 * 60, show_spinner=False)  # 1 hour
+def fetch_front_month_ng_history(start: str = "2020-01-01") -> pd.DataFrame:
+    """Fetch continuous front-month NG futures (NG=F) daily history via yfinance.
+    Returns columns: date, close
+    """
+    if yf is None:
+        raise ImportError("yfinance is not installed. Run: pip install yfinance")
+
+    df = yf.download("NG=F", start=start, progress=False, auto_adjust=False)
+    if df is None or df.empty:
+        raise ValueError("No data returned for NG=F (check internet / ticker availability).")
+
+    # If yfinance returns MultiIndex columns, try to pull the Close field safely.
+    close_df = None
+    if isinstance(df.columns, pd.MultiIndex):
+        # Prefer Close level if available
+        if "Close" in df.columns.get_level_values(0):
+            close_df = df.xs("Close", axis=1, level=0, drop_level=False)
+        elif "Adj Close" in df.columns.get_level_values(0):
+            close_df = df.xs("Adj Close", axis=1, level=0, drop_level=False)
+
+    if close_df is not None:
+        # Take first column (single ticker) and name it close
+        close_series = close_df.iloc[:, 0]
+        out = close_series.to_frame(name="close").reset_index()
+    else:
+        # Single-level columns (common case)
+        col = "Close" if "Close" in df.columns else ("Adj Close" if "Adj Close" in df.columns else df.columns[0])
+        out = df[[col]].rename(columns={col: "close"}).reset_index()
+
+    # Robustly name the date column (yfinance can return Date/Datetime/index)
+    if "Date" in out.columns:
+        out = out.rename(columns={"Date": "date"})
+    elif "Datetime" in out.columns:
+        out = out.rename(columns={"Datetime": "date"})
+    elif "index" in out.columns:
+        out = out.rename(columns={"index": "date"})
+    else:
+        out = out.rename(columns={out.columns[0]: "date"})
+
+    # If duplicate columns create a DataFrame for 'date'/'close', pick first.
+    if "date" in out.columns and isinstance(out["date"], pd.DataFrame):
+        out["date"] = out["date"].iloc[:, 0]
+    if "close" in out.columns and isinstance(out["close"], pd.DataFrame):
+        out["close"] = out["close"].iloc[:, 0]
+
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    # Drop timezone if present
+    try:
+        out["date"] = out["date"].dt.tz_localize(None)
+    except Exception:
+        pass
+
+    out["close"] = pd.to_numeric(out["close"], errors="coerce")
+    out = out.dropna(subset=["date", "close"]).sort_values("date")
+    return out
+
+
+def build_yearly_seasonality(df: pd.DataFrame, year_start: int = 2020, year_end: int = 2026) -> pd.DataFrame:
+    """Build a MM-DD indexed table with each year as a column (seasonality overlay)."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    d = df.copy()
+
+    # Minimal safety: ensure a usable "date" column exists (handles index/Date/Datetime/MultiIndex)
+    if isinstance(d.columns, pd.MultiIndex):
+        d.columns = ["_".join([str(x) for x in tup if x not in (None, "")]).strip() for tup in d.columns]
+    if "date" not in d.columns:
+        if "Date" in d.columns:
+            d = d.rename(columns={"Date": "date"})
+        elif "Datetime" in d.columns:
+            d = d.rename(columns={"Datetime": "date"})
+        else:
+            d = d.reset_index()
+            if "date" not in d.columns:
+                if "Date" in d.columns:
+                    d = d.rename(columns={"Date": "date"})
+                elif "Datetime" in d.columns:
+                    d = d.rename(columns={"Datetime": "date"})
+                elif "index" in d.columns:
+                    d = d.rename(columns={"index": "date"})
+                else:
+                    d = d.rename(columns={d.columns[0]: "date"})
+    d["date"] = pd.to_datetime(d["date"], errors="coerce")
+    d = d.dropna(subset=["date"])
+
+    d["year"] = d["date"].dt.year
+    d = d[(d["year"] >= year_start) & (d["year"] <= year_end)]
+    if d.empty:
+        return pd.DataFrame()
+    d["mmdd"] = d["date"].dt.strftime("%m-%d")
+    piv = d.pivot_table(index="mmdd", columns="year", values="close", aggfunc="last")
+    # Sort mmdd in calendar order
+    piv = piv.reindex(sorted(piv.index), axis=0)
+    piv = piv.sort_index()
+    return piv
 
 # -----------------------------
 # EIA Storage (via SeriesID API)
@@ -290,9 +398,83 @@ if auto_refresh:
 # -----------------------------
 _MONTH_CODE = {1:"F",2:"G",3:"H",4:"J",5:"K",6:"M",7:"N",8:"Q",9:"U",10:"V",11:"X",12:"Z"}
 
-def _is_business_day(d: "dt.date") -> bool:
-    # Weekend-only calendar (no CME holiday adjustments)
-    return d.weekday() < 5
+def _observed_date(d: dt.date) -> dt.date:
+    # If holiday falls on Saturday -> observed Friday; Sunday -> observed Monday
+    if d.weekday() == 5:
+        return d - dt.timedelta(days=1)
+    if d.weekday() == 6:
+        return d + dt.timedelta(days=1)
+    return d
+
+def _nth_weekday_of_month(year: int, month: int, weekday: int, n: int) -> dt.date:
+    # weekday: Monday=0 ... Sunday=6
+    first = dt.date(year, month, 1)
+    shift = (weekday - first.weekday()) % 7
+    day = 1 + shift + (n - 1) * 7
+    return dt.date(year, month, day)
+
+def _last_weekday_of_month(year: int, month: int, weekday: int) -> dt.date:
+    # weekday: Monday=0 ... Sunday=6
+    if month == 12:
+        next_month = dt.date(year + 1, 1, 1)
+    else:
+        next_month = dt.date(year, month + 1, 1)
+    last_day = next_month - dt.timedelta(days=1)
+    shift = (last_day.weekday() - weekday) % 7
+    return last_day - dt.timedelta(days=shift)
+
+def _easter_sunday(year: int) -> dt.date:
+    # Anonymous Gregorian algorithm
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = ((h + l - 7 * m + 114) % 31) + 1
+    return dt.date(year, month, day)
+
+def _cme_like_holidays(year: int) -> set[dt.date]:
+    """Approximate holiday set for NG futures (good enough for rollover estimates).
+    Includes major US holidays + Good Friday. (Early closes not modeled.)
+    """
+    holidays = set()
+
+    # Fixed-date holidays (observed)
+    holidays.add(_observed_date(dt.date(year, 1, 1)))   # New Year's Day
+    holidays.add(_observed_date(dt.date(year, 6, 19)))  # Juneteenth
+    holidays.add(_observed_date(dt.date(year, 7, 4)))   # Independence Day
+    holidays.add(_observed_date(dt.date(year, 12, 25))) # Christmas
+
+    # Monday holidays
+    holidays.add(_nth_weekday_of_month(year, 1, 0, 3))  # MLK Day (3rd Mon Jan)
+    holidays.add(_nth_weekday_of_month(year, 2, 0, 3))  # Presidents' Day (3rd Mon Feb)
+    holidays.add(_last_weekday_of_month(year, 5, 0))    # Memorial Day (last Mon May)
+    holidays.add(_nth_weekday_of_month(year, 9, 0, 1))  # Labor Day (1st Mon Sep)
+
+    # Thanksgiving (4th Thu Nov)
+    holidays.add(_nth_weekday_of_month(year, 11, 3, 4))
+
+    # Good Friday
+    holidays.add(_easter_sunday(year) - dt.timedelta(days=2))
+
+    return holidays
+
+def _holiday_set_for_years(years: List[int]) -> set[dt.date]:
+    s: set[dt.date] = set()
+    for y in years:
+        s |= _cme_like_holidays(y)
+    return s
+
+def _is_business_day(d: "dt.date", holiday_set: set[dt.date]) -> bool:
+    return (d.weekday() < 5) and (d not in holiday_set)
 
 def _add_business_days(d: "dt.date", n: int) -> "dt.date":
     step = 1 if n >= 0 else -1
@@ -300,7 +482,7 @@ def _add_business_days(d: "dt.date", n: int) -> "dt.date":
     cur = d
     while remaining > 0:
         cur = cur + dt.timedelta(days=step)
-        if _is_business_day(cur):
+        if _is_business_day(cur, holiday_set):
             remaining -= 1
     return cur
 
@@ -313,7 +495,7 @@ def ng_contract_expiry(delivery_year: int, delivery_month: int) -> "dt.date":
     count = 0
     while count < 3:
         cur = cur - dt.timedelta(days=1)
-        if _is_business_day(cur):
+        if _is_business_day(cur, holiday_set):
             count += 1
     return cur
 
@@ -699,14 +881,51 @@ with tabs[2]:
 
     st.write(" • ".join(summary_parts))
 
+st.divider()
+st.subheader("Front-month Natural Gas price — 5-year comparison (2020–2026)")
+st.caption("Data source: Yahoo Finance continuous front-month futures (ticker: NG=F).")
+
+if yf is None:
+    st.info("To enable this chart, install yfinance:  `pip install yfinance`  (then restart the app).")
+else:
+    try:
+        hist = fetch_front_month_ng_history(start="2020-01-01")
+        season = build_yearly_seasonality(hist, year_start=2020, year_end=2026)
+
+        if season.empty:
+            st.warning("No NG=F data available for 2020–2026.")
+        else:
+            st.line_chart(season, use_container_width=True)
+            with st.expander("Show raw data (last 30 rows)"):
+                st.dataframe(hist.tail(30), use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.warning(f"Could not load NG front-month prices: {e}")
+
+
+
 
 
 # -----------------------------
 # Tab 4: Contracts & Rollover
 # -----------------------------
 with tabs[3]:
+
+    # Holiday set for more accurate rollover estimates (major US holidays + Good Friday)
+    years = list(range(dt.date.today().year - 1, dt.date.today().year + 3))
+    holiday_set = _holiday_set_for_years(years)
     st.subheader("Henry Hub NG — Contracts & Rollover (Estimate)")
     st.caption("Expiry rule used: 3 business days before the 1st of the delivery month (weekends only). Holidays can shift dates.")
+
+    with st.expander("CME holidays used (observed dates) — for rollover math", expanded=False):
+        # Show the holiday dates the app is using for business-day calculations
+        hol_by_year = {}
+        for d in sorted(holiday_set):
+            hol_by_year.setdefault(d.year, []).append(d)
+        for yy in sorted(hol_by_year):
+            st.markdown(f"**{yy}**")
+            st.write(", ".join([x.strftime("%Y-%m-%d") for x in hol_by_year[yy]]))
+        st.caption("Note: This is an approximation (major US holidays + Good Friday). Early-close days are not included.")
+
 
     today = dt.date.today()
     y, m = front_delivery_month(today)
