@@ -12,11 +12,50 @@ from typing import Dict, List, Tuple
 import pandas as pd
 import requests
 import streamlit as st
+import numpy as np
 
 
 # -----------------------------
 # Helpers
 # -----------------------------
+def fetch_eia_storage_us_total(api_key):
+    """
+    Fetch latest US working gas in storage (BCF)
+    Safely handles cases when only one data point is returned.
+    """
+    url = (
+        "https://api.eia.gov/v2/natural-gas/stor/wkly/data/"
+        f"?api_key={api_key}"
+        "&frequency=weekly"
+        "&data[0]=value"
+        "&facets[series][]=NG.NW2_EPG0_SWO_R48_BCF"
+        "&sort[0][column]=period"
+        "&sort[0][direction]=desc"
+        "&length=2"
+    )
+
+    r = requests.get(url, timeout=10)
+    r.raise_for_status()
+
+    data = r.json()["response"]["data"]
+    df = pd.DataFrame(data)
+
+    if df.empty:
+        return None, None
+
+    latest = float(df.iloc[0]["value"])
+
+    # 👇 SAFE CHECK
+    if len(df) > 1:
+        previous = float(df.iloc[1]["value"])
+        weekly_change = latest - previous
+    else:
+        weekly_change = None  # EIA returned only one week
+
+    return latest, weekly_change
+
+
+
 def f_to_c(f: float) -> float:
     return (f - 32.0) * 5.0 / 9.0
 
@@ -140,77 +179,14 @@ def fetch_eia_series(series_id: str, api_key: str) -> pd.DataFrame:
     return df
 
 
-def project_next_week_storage(stor: pd.DataFrame) -> dict:
+def compute_weekly_change(storage_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Simple projection for next week's storage:
-    - Recent trend: average of last 4 weekly changes
-    - Seasonal: median weekly change for same ISO week in prior years (up to 5 years)
-    Projection = 70% recent + 30% seasonal (if seasonal available)
+    Adds weekly injection/withdrawal (difference) column.
+    Positive = injection, Negative = withdrawal.
     """
-    if stor is None or stor.empty or "value" not in stor.columns:
-        return {"ok": False, "reason": "No storage data"}
-
-    s = stor.dropna(subset=["value"]).sort_values("date").copy()
-    if len(s) < 3:
-        return {"ok": False, "reason": "Not enough history"}
-
-    # Ensure weekly_change exists
-    if "weekly_change" not in s.columns:
-        s["weekly_change"] = s["value"].diff()
-
-    last_row = s.iloc[-1]
-    last_date = pd.to_datetime(last_row["date"])
-    last_storage = float(last_row["value"])
-
-    # Recent avg (last 4 changes)
-    recent = s["weekly_change"].dropna().tail(4)
-    recent_avg = float(recent.mean()) if len(recent) else float("nan")
-
-    # Seasonal median for next week's ISO week
-    next_date = last_date + pd.Timedelta(days=7)
-    iso_week = int(next_date.isocalendar().week)
-    iso_year = int(next_date.isocalendar().year)
-
-    s2 = s.copy()
-    iso = s2["date"].dt.isocalendar()
-    s2["iso_week"] = iso.week.astype(int)
-    s2["iso_year"] = iso.year.astype(int)
-
-    seasonal_pool = s2[(s2["iso_week"] == iso_week) & (s2["iso_year"] < iso_year)]
-    # keep last ~5 years
-    seasonal_pool = seasonal_pool.sort_values("date").tail(5 * 1)  # ~5 samples (weekly)
-    seasonal_vals = seasonal_pool["weekly_change"].dropna()
-
-    seasonal_median = float(seasonal_vals.median()) if len(seasonal_vals) else float("nan")
-
-    # Blend
-    if pd.isna(seasonal_median) and pd.isna(recent_avg):
-        return {"ok": False, "reason": "Cannot compute projection"}
-
-    if pd.isna(seasonal_median):
-        proj_change = recent_avg
-        method = "Recent 4-week avg"
-    elif pd.isna(recent_avg):
-        proj_change = seasonal_median
-        method = "Seasonal median"
-    else:
-        proj_change = 0.7 * recent_avg + 0.3 * seasonal_median
-        method = "70% recent + 30% seasonal"
-
-    proj_storage = last_storage + proj_change
-    direction = "Injection" if proj_change > 0 else "Withdrawal" if proj_change < 0 else "Flat"
-
-    return {
-        "ok": True,
-        "last_date": last_date,
-        "next_date": next_date,
-        "last_storage": last_storage,
-        "proj_change": float(proj_change),
-        "proj_storage": float(proj_storage),
-        "direction": direction,
-        "method": method,
-    }
-
+    df = storage_df.copy().sort_values("date")
+    df["weekly_change"] = df["value"].diff()
+    return df
 
 
 # -----------------------------
@@ -274,7 +250,7 @@ with st.sidebar:
         help="Get a key from EIA. Tip: you can set an environment variable EIA_API_KEY.",
     )
 
-tabs = st.tabs(["GWDD Dashboard", "EIA Storage Dashboard"])
+tabs = st.tabs(["GWDD Dashboard", "EIA Storage Dashboard", "Signals & Summary"])
 
 # -----------------------------
 # Tab 1: GWDD
@@ -375,3 +351,269 @@ with tabs[1]:
     except Exception as e:
         st.error(f"EIA Storage fetch failed: {e}")
         st.info("Fix: enter your EIA API key in the sidebar. Also check your internet connection.")
+
+
+# -----------------------------
+# Signals & Summary (NEW)
+# -----------------------------
+def _linear_slope(x, y) -> float:
+    """Simple least-squares slope. Returns 0 if not enough points."""
+    try:
+        x = np.asarray(x, dtype=float)
+        y = np.asarray(y, dtype=float)
+        if len(x) < 2:
+            return 0.0
+        x_mean = x.mean()
+        y_mean = y.mean()
+        denom = ((x - x_mean) ** 2).sum()
+        if denom == 0:
+            return 0.0
+        return float(((x - x_mean) * (y - y_mean)).sum() / denom)
+    except Exception:
+        return 0.0
+
+
+def _compute_overall_weighted_gwdd(cities_df: pd.DataFrame, base_f: float, days: int) -> pd.DataFrame:
+    """Reuses the same logic as GWDD tab to build overall weighted GWDD daily series."""
+    overall_rows = []
+    for _, row in cities_df.iterrows():
+        try:
+            cdf = fetch_open_meteo_daily(float(row["lat"]), float(row["lon"]), days=days)
+            if cdf.empty:
+                continue
+            gwdd = compute_gwdd(cdf, base_f=base_f)
+            for d, g in zip(gwdd["date"].tolist(), gwdd["gwdd"].tolist()):
+                overall_rows.append((d, float(g) * float(row["weight"])))
+        except Exception:
+            continue
+
+    if not overall_rows:
+        return pd.DataFrame(columns=["date", "gwdd_overall_weighted"])
+
+    overall = pd.DataFrame(overall_rows, columns=["date", "weighted_gwdd"])
+    overall = overall.groupby("date", as_index=False)["weighted_gwdd"].sum()
+    overall = overall.rename(columns={"weighted_gwdd": "gwdd_overall_weighted"}).sort_values("date")
+    return overall
+
+
+def _compute_ng_signal(overall_gwdd_df: pd.DataFrame, storage_df_with_change: pd.DataFrame) -> dict:
+    """
+    Simple heuristic signal:
+      - GWDD slope over forecast window (higher GWDD => higher demand => bullish)
+      - Latest EIA weekly change (negative = withdrawal = bullish, positive = injection = bearish)
+      - Divergence alert when GWDD and storage change point opposite ways.
+    """
+    out = {
+        "gwdd_slope": 0.0,
+        "gwdd_trend": "Neutral",
+        "latest_storage_bcf": None,
+        "latest_weekly_change_bcf": None,
+        "signal": "Neutral",
+        "divergence": False,
+        "notes": [],
+    }
+
+    # GWDD trend (use slope)
+    if overall_gwdd_df is not None and not overall_gwdd_df.empty:
+        y = overall_gwdd_df["gwdd_overall_weighted"].astype(float).to_numpy()
+        x = np.arange(len(y), dtype=float)
+        slope = _linear_slope(x, y)
+        out["gwdd_slope"] = slope
+
+        # thresholds (tuned to avoid noise)
+        if slope > 0.15:
+            out["gwdd_trend"] = "Rising (colder / higher demand)"
+        elif slope < -0.15:
+            out["gwdd_trend"] = "Falling (warmer / lower demand)"
+        else:
+            out["gwdd_trend"] = "Flat / Mixed"
+
+    # Storage (latest)
+    if storage_df_with_change is not None and not storage_df_with_change.empty:
+        s = storage_df_with_change.sort_values("date")
+        out["latest_storage_bcf"] = float(s["value"].iloc[-1])
+        if "weekly_change" in s.columns and len(s) >= 2:
+            out["latest_weekly_change_bcf"] = float(s["weekly_change"].iloc[-1])
+
+    # Build bullish/bearish summary
+    gwdd_up = out["gwdd_slope"] > 0.15
+    gwdd_down = out["gwdd_slope"] < -0.15
+    chg = out["latest_weekly_change_bcf"]
+
+    if chg is None:
+        # GWDD-only
+        if gwdd_up:
+            out["signal"] = "Bullish (GWDD rising)"
+        elif gwdd_down:
+            out["signal"] = "Bearish (GWDD falling)"
+        else:
+            out["signal"] = "Neutral"
+    else:
+        # Combined
+        withdrawal = chg < 0
+        injection = chg > 0
+
+        if withdrawal and gwdd_up:
+            out["signal"] = "Bullish (withdrawal + colder trend)"
+        elif injection and gwdd_down:
+            out["signal"] = "Bearish (injection + warmer trend)"
+        elif withdrawal and gwdd_down:
+            out["signal"] = "Mixed (withdrawal but GWDD falling)"
+            out["divergence"] = True
+        elif injection and gwdd_up:
+            out["signal"] = "Mixed (injection but GWDD rising)"
+            out["divergence"] = True
+        else:
+            out["signal"] = "Neutral"
+
+    if out["divergence"]:
+        out["notes"].append("GWDD trend and latest storage change are pointing opposite ways (divergence).")
+
+    return out
+
+
+def _project_next_week_storage(storage_df_with_change: pd.DataFrame, method: str = "avg4") -> dict:
+    """
+    Project next week's storage level using recent average weekly change.
+    method: avg4 / avg8 / last
+    """
+    out = {
+        "latest_date": None,
+        "latest_storage_bcf": None,
+        "projection_method": method,
+        "projected_change_bcf": None,
+        "projected_next_storage_bcf": None,
+    }
+    if storage_df_with_change is None or storage_df_with_change.empty:
+        return out
+
+    s = storage_df_with_change.sort_values("date").copy()
+    out["latest_date"] = s["date"].iloc[-1]
+    out["latest_storage_bcf"] = float(s["value"].iloc[-1])
+
+    changes = s["weekly_change"].dropna().astype(float)
+    if changes.empty:
+        return out
+
+    if method == "last":
+        proj_change = float(changes.iloc[-1])
+    elif method == "avg8":
+        proj_change = float(changes.tail(8).mean())
+    else:  # avg4
+        proj_change = float(changes.tail(4).mean())
+
+    out["projected_change_bcf"] = proj_change
+    out["projected_next_storage_bcf"] = float(out["latest_storage_bcf"] + proj_change)
+    return out
+
+
+with tabs[2]:
+    st.header("Signals & Summary")
+    st.caption("Bullish/Bearish summary + GWDD vs EIA divergence alert + projected next-week storage level.")
+
+    # Build fresh (cached) data needed for the signal
+    overall = _compute_overall_weighted_gwdd(cities_df, base_f=base_f, days=days)
+
+    storage_with_change = None
+    if api_key and str(api_key).strip():
+        try:
+            stor_sig = fetch_eia_series(EIA_SERIES_TOTAL_R48, api_key=str(api_key).strip())
+            storage_with_change = compute_weekly_change(stor_sig)
+        except Exception as e:
+            storage_with_change = None
+            st.warning(f"EIA fetch failed for signals: {e}")
+
+    signal = _compute_ng_signal(overall, storage_with_change)
+
+    # Top signal box
+    sig_text = signal["signal"]
+    if sig_text.lower().startswith("bullish"):
+        st.success(f"Signal: **{sig_text}**")
+    elif sig_text.lower().startswith("bearish"):
+        st.error(f"Signal: **{sig_text}**")
+    else:
+        st.info(f"Signal: **{sig_text}**")
+
+    # Divergence alert
+    if signal["divergence"]:
+        st.warning("⚠️ **GWDD ↔ EIA Divergence Alert**: GWDD trend and the latest storage change are conflicting.")
+
+    # Key numbers
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("GWDD Trend", signal["gwdd_trend"])
+    with c2:
+        if signal["latest_weekly_change_bcf"] is None:
+            st.metric("Latest weekly change (BCF)", "N/A")
+        else:
+            st.metric("Latest weekly change (BCF)", f"{signal['latest_weekly_change_bcf']:.0f}")
+    with c3:
+        if signal["latest_storage_bcf"] is None:
+            st.metric("Latest storage (BCF)", "N/A")
+        else:
+            st.metric("Latest storage (BCF)", f"{signal['latest_storage_bcf']:.0f}")
+
+    if signal["notes"]:
+        st.write("Notes:")
+        for n in signal["notes"]:
+            st.write(f"- {n}")
+
+    st.divider()
+
+    st.subheader("Projected storage level for the following week")
+    if storage_with_change is None or storage_with_change.empty:
+        st.info("Enter a valid EIA API key to enable storage projection.")
+    else:
+        method = st.selectbox("Projection method", ["avg4", "avg8", "last"], index=0)
+        proj = _project_next_week_storage(storage_with_change, method=method)
+
+        use_manual = st.checkbox("Manual override (enter expected weekly change)", value=False)
+        if use_manual:
+            proj_change = st.number_input(
+                "Expected weekly change (BCF). Positive=injection, negative=withdrawal",
+                value=float(proj["projected_change_bcf"] or 0.0),
+                step=1.0
+            )
+            proj_change = float(proj_change)
+        else:
+            proj_change = float(proj["projected_change_bcf"] or 0.0)
+
+        projected_next = float(proj["latest_storage_bcf"] + proj_change)
+
+        d1, d2, d3 = st.columns(3)
+        with d1:
+            st.metric("Latest storage (BCF)", f"{proj['latest_storage_bcf']:.0f}")
+        with d2:
+            st.metric("Projected change (BCF)", f"{proj_change:+.0f}")
+        with d3:
+            st.metric("Projected next-week storage (BCF)", f"{projected_next:.0f}")
+
+        st.dataframe(
+            pd.DataFrame(
+                [{
+                    "latest_date": proj["latest_date"],
+                    "latest_storage_bcf": proj["latest_storage_bcf"],
+                    "projection_method": ("manual" if use_manual else method),
+                    "projected_change_bcf": proj_change,
+                    "projected_next_storage_bcf": projected_next,
+                }]
+            ),
+            use_container_width=True,
+        )
+
+    st.divider()
+
+    st.subheader("Full summary (all-in-one)")
+    summary_parts = []
+    summary_parts.append(f"GWDD: {signal['gwdd_trend']} (slope {signal['gwdd_slope']:+.2f}/day)")
+    if signal["latest_weekly_change_bcf"] is not None:
+        chg = signal["latest_weekly_change_bcf"]
+        summary_parts.append(f"EIA weekly change: {chg:+.0f} BCF")
+    if signal["latest_storage_bcf"] is not None:
+        summary_parts.append(f"Latest storage: {signal['latest_storage_bcf']:.0f} BCF")
+    summary_parts.append(f"Signal: {signal['signal']}")
+    if signal["divergence"]:
+        summary_parts.append("ALERT: GWDD ↔ EIA divergence")
+
+    st.write(" • ".join(summary_parts))
+
