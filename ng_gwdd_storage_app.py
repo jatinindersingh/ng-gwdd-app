@@ -284,7 +284,55 @@ if auto_refresh:
     # Browser meta-refresh (no extra packages needed)
     st.markdown("<meta http-equiv='refresh' content='60'>", unsafe_allow_html=True)
 
-tabs = st.tabs(["GWDD Dashboard", "EIA Storage Dashboard", "Signals & Summary"])
+
+# -----------------------------
+# Contracts & Rollover helpers
+# -----------------------------
+_MONTH_CODE = {1:"F",2:"G",3:"H",4:"J",5:"K",6:"M",7:"N",8:"Q",9:"U",10:"V",11:"X",12:"Z"}
+
+def _is_business_day(d: "dt.date") -> bool:
+    # Weekend-only calendar (no CME holiday adjustments)
+    return d.weekday() < 5
+
+def _add_business_days(d: "dt.date", n: int) -> "dt.date":
+    step = 1 if n >= 0 else -1
+    remaining = abs(n)
+    cur = d
+    while remaining > 0:
+        cur = cur + dt.timedelta(days=step)
+        if _is_business_day(cur):
+            remaining -= 1
+    return cur
+
+def ng_contract_expiry(delivery_year: int, delivery_month: int) -> "dt.date":
+    # Rule of thumb (NYMEX Henry Hub NG): trading terminates 3 business days prior to
+    # the first calendar day of the delivery month (weekend-adjusted only here).
+    first_day = dt.date(delivery_year, delivery_month, 1)
+    # Go back 3 business days from first_day
+    cur = first_day
+    count = 0
+    while count < 3:
+        cur = cur - dt.timedelta(days=1)
+        if _is_business_day(cur):
+            count += 1
+    return cur
+
+def ng_symbol(delivery_year: int, delivery_month: int) -> str:
+    yy = str(delivery_year)[-2:]
+    return f"NG{_MONTH_CODE[delivery_month]}{yy}"
+
+def front_delivery_month(today: "dt.date") -> tuple[int,int]:
+    # Choose the nearest delivery month that has not expired yet.
+    y, m = today.year, today.month
+    exp = ng_contract_expiry(y, m)
+    if today <= exp:
+        return y, m
+    # else next month
+    if m == 12:
+        return y+1, 1
+    return y, m+1
+
+tabs = st.tabs(["GWDD Dashboard", "EIA Storage Dashboard", "Signals & Summary", "Contracts & Rollover"])
 
 # -----------------------------
 # Tab 1: GWDD
@@ -651,3 +699,53 @@ with tabs[2]:
 
     st.write(" • ".join(summary_parts))
 
+
+
+# -----------------------------
+# Tab 4: Contracts & Rollover
+# -----------------------------
+with tabs[3]:
+    st.subheader("Henry Hub NG — Contracts & Rollover (Estimate)")
+    st.caption("Expiry rule used: 3 business days before the 1st of the delivery month (weekends only). Holidays can shift dates.")
+
+    today = dt.date.today()
+    y, m = front_delivery_month(today)
+    exp = ng_contract_expiry(y, m)
+    roll_start = _add_business_days(exp, -5)
+    roll_reco = _add_business_days(exp, -1)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Today", today.strftime("%Y-%m-%d"))
+    c2.metric("Front (delivery) month", f"{y}-{m:02d}  ({ng_symbol(y,m)})")
+    c3.metric("Estimated expiry", exp.strftime("%Y-%m-%d"))
+
+    st.markdown(
+        f"""
+**Rollover window (suggested):** {roll_start.strftime("%Y-%m-%d")} to {exp.strftime("%Y-%m-%d")}  
+**Suggested rollover day:** {roll_reco.strftime("%Y-%m-%d")} (1 business day before expiry)
+
+If you trade **NG=F (Yahoo front month)** or CFDs, the rollover behavior can differ by broker/platform.
+"""
+    )
+
+    # Next 12 delivery months table
+    rows = []
+    yy, mm = y, m
+    for i in range(12):
+        sym = ng_symbol(yy, mm)
+        expiry = ng_contract_expiry(yy, mm)
+        rows.append({
+            "Delivery Month": f"{yy}-{mm:02d}",
+            "Symbol": sym,
+            "Estimated Expiry": expiry.strftime("%Y-%m-%d"),
+            "Suggested Rollover": _add_business_days(expiry, -1).strftime("%Y-%m-%d"),
+        })
+        # advance month
+        if mm == 12:
+            yy += 1
+            mm = 1
+        else:
+            mm += 1
+
+    df_roll = pd.DataFrame(rows)
+    st.dataframe(df_roll, use_container_width=True)
