@@ -21,6 +21,25 @@ except Exception:
     yf = None
 
 
+@st.cache_data(ttl=60*15, show_spinner=False)
+def fetch_yahoo_last_price(ticker: str) -> float | None:
+    """Fetch last available close price for a Yahoo Finance ticker using yfinance.
+    Returns None if yfinance not installed or no data."""
+    if yf is None:
+        return None
+    try:
+        df = yf.download(ticker, period="7d", interval="1d", progress=False, auto_adjust=False)
+        if df is None or df.empty:
+            return None
+        # prefer Close
+        col = "Close" if "Close" in df.columns else ("Adj Close" if "Adj Close" in df.columns else df.columns[-1])
+        val = df[col].dropna().iloc[-1]
+        return float(val)
+    except Exception:
+        return None
+
+
+
 # -----------------------------
 # Helpers
 # -----------------------------
@@ -223,6 +242,14 @@ def build_yearly_seasonality(df: pd.DataFrame, year_start: int = 2020, year_end:
 # EIA Storage (via SeriesID API)
 # -----------------------------
 EIA_SERIES_TOTAL_R48 = "NG.NW2_EPG0_SWO_R48_BCF.W"  # Total Lower 48, Working gas in storage (BCF), weekly
+
+
+# -----------------------------
+# NOAA 8–14 Day Outlook (IMAGE ONLY — SAFE)
+# -----------------------------
+NOAA_814_TEMP_MAP = "https://www.cpc.ncep.noaa.gov/products/predictions/814day/814temp.new.gif"
+NOAA_814_DISCUSSION = "https://www.cpc.ncep.noaa.gov/products/predictions/814day/fxus06.html"
+
 
 
 @st.cache_data(ttl=60 * 60 * 6, show_spinner=False)  # 6 hours
@@ -773,6 +800,30 @@ def _project_next_week_storage(storage_df_with_change: pd.DataFrame, method: str
 
 with tabs[2]:
     st.header("Signals & Summary")
+    st.divider()
+    st.subheader("🌡️ NOAA 8–14 Day Temperature Outlook (Weather → NG Demand)")
+
+    colA, colB = st.columns([2, 1])
+
+    with colA:
+        st.image(
+            NOAA_814_TEMP_MAP,
+            caption="NOAA CPC 8–14 Day Temperature Outlook (Blue = colder, Red = warmer)",
+            use_container_width=True
+        )
+
+    with colB:
+        st.markdown("### How to read")
+        st.markdown(
+            """
+- **Blue areas** → Colder than normal → **Bullish NG**
+- **Red areas** → Warmer than normal → **Bearish NG**
+- **Neutral/white** → Mixed → Range-bound NG
+            """
+        )
+        st.markdown(f"[📄 NOAA Official Discussion]({NOAA_814_DISCUSSION})")
+
+
     st.caption("Bullish/Bearish summary + GWDD vs EIA divergence alert + projected next-week storage level.")
 
     # Build fresh (cached) data needed for the signal
@@ -937,6 +988,69 @@ with tabs[3]:
     c1.metric("Today", today.strftime("%Y-%m-%d"))
     c2.metric("Front (delivery) month", f"{y}-{m:02d}  ({ng_symbol(y,m)})")
     c3.metric("Estimated expiry", exp.strftime("%Y-%m-%d"))
+    # -----------------------------
+    # Contango / Backwardation check (Front vs Next contract)
+    # -----------------------------
+    st.markdown("### Curve check: Next contract contango or backwardation?")
+
+    # Determine next delivery month
+    if m == 12:
+        ny, nm = y + 1, 1
+    else:
+        ny, nm = y, m + 1
+
+    front_yahoo = f"{ng_symbol(y, m)}.NYM"
+    next_yahoo = f"{ng_symbol(ny, nm)}.NYM"
+
+    if yf is None:
+        st.info("To auto-check contango/backwardation, install yfinance:  `pip install yfinance`  (then restart the app).")
+        front_px = st.number_input("Front contract price (manual)", value=0.0, step=0.01, help="Enter front-month futures price (USD/MMBtu)")
+        next_px = st.number_input("Next contract price (manual)", value=0.0, step=0.01, help="Enter next-month futures price (USD/MMBtu)")
+    else:
+        front_px = fetch_yahoo_last_price(front_yahoo)
+        next_px = fetch_yahoo_last_price(next_yahoo)
+
+        c4, c5 = st.columns(2)
+        with c4:
+            st.metric("Front (Yahoo)", front_yahoo, help="Yahoo monthly futures ticker (delayed)")
+        with c5:
+            st.metric("Next (Yahoo)", next_yahoo, help="Yahoo monthly futures ticker (delayed)")
+
+        if front_px is None or next_px is None:
+            st.warning("Could not load one or both monthly contract prices from Yahoo. You can still enter prices manually below.")
+            front_px = st.number_input("Front contract price (manual)", value=float(front_px or 0.0), step=0.01)
+            next_px = st.number_input("Next contract price (manual)", value=float(next_px or 0.0), step=0.01)
+
+    # Compute structure
+    structure = "N/A"
+    spread = None
+    spread_pct = None
+    if front_px and next_px and float(front_px) != 0.0:
+        spread = float(next_px) - float(front_px)
+        spread_pct = (spread / float(front_px)) * 100.0
+
+        if spread > 0:
+            structure = "Contango (next > front) → rollover drag for longs (HNU), helps shorts (HND)"
+        elif spread < 0:
+            structure = "Backwardation (next < front) → rollover benefit for longs (HNU), hurts shorts (HND)"
+        else:
+            structure = "Flat (next ≈ front) → minimal rollover impact"
+
+    s1, s2, s3 = st.columns(3)
+    with s1:
+        st.metric("Front price", "N/A" if front_px is None else f"{float(front_px):.3f}")
+    with s2:
+        st.metric("Next price", "N/A" if next_px is None else f"{float(next_px):.3f}")
+    with s3:
+        if spread is None:
+            st.metric("Spread (next-front)", "N/A")
+        else:
+            st.metric("Spread (next-front)", f"{spread:+.3f} ({spread_pct:+.2f}%)")
+
+    if structure != "N/A":
+        st.write(f"**Structure:** {structure}")
+    st.caption("Note: This is a simple front-vs-next check using delayed Yahoo monthly futures (or manual input).")
+
 
     st.markdown(
         f"""
