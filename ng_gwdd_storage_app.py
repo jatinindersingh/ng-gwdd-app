@@ -352,6 +352,36 @@ def compute_weekly_change(storage_df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+
+# -----------------------------
+# EIA report forecast (date + actual auto-update)
+# -----------------------------
+@st.cache_data(ttl=60 * 5, show_spinner=False)  # refresh fast near release time
+def fetch_eia_latest_storage_and_change(api_key: str) -> dict:
+    """Returns latest period date, storage level and the latest weekly change (actual)."""
+    stor = fetch_eia_series(EIA_SERIES_TOTAL_R48, api_key=str(api_key).strip())
+    stor = compute_weekly_change(stor)
+    stor = stor.dropna(subset=["value"]).sort_values("date")
+    latest = stor.iloc[-1]
+    prev = stor.iloc[-2] if len(stor) >= 2 else None
+    actual_change = float(latest["value"] - prev["value"]) if prev is not None else None
+    return {
+        "latest_period_date": latest["date"].date(),
+        "latest_storage_bcf": float(latest["value"]),
+        "actual_weekly_change_bcf": actual_change,
+    }
+
+def estimate_next_eia_report_date(today: dt.date | None = None) -> dt.date:
+    """EIA NG storage report is typically Thursday.
+    This returns the next Thursday date (local calendar)."""
+    if today is None:
+        today = dt.date.today()
+    THU = 3  # Monday=0
+    days_ahead = (THU - today.weekday()) % 7
+    # If today is Thursday, treat it as 'next' (user can refresh after release).
+    return today + dt.timedelta(days=days_ahead)
+
+
 # -----------------------------
 # Default Cities (you can edit in UI)
 # -----------------------------
@@ -413,7 +443,14 @@ with st.sidebar:
         help="Get a key from EIA. Tip: you can set an environment variable EIA_API_KEY.",
     )
 
-
+    # Market expectation for the *next* EIA storage report (manual entry).
+    # Negative = expected withdrawal, Positive = expected injection.
+    eia_market_forecast_bcf = st.number_input(
+        "Next EIA report market forecast (BCF)",
+        value=-107.0,
+        step=1.0,
+        help="Enter the market/analyst estimate for the upcoming EIA storage change. Example: -107 = expected 107 Bcf withdrawal.",
+    )
 auto_refresh = st.checkbox("Auto refresh every 1 minute", value=False)
 if auto_refresh:
     # Browser meta-refresh (no extra packages needed)
@@ -609,9 +646,95 @@ with tabs[0]:
 with tabs[1]:
     st.subheader("EIA Weekly Natural Gas Storage (BCF) + Weekly Injection/Withdrawal")
 
+    st.markdown("### EIA storage report (forecast + actual)")
+    next_report_date = estimate_next_eia_report_date(dt.date.today())
+    st.caption(f"Estimated next report date: **{next_report_date.strftime('%Y-%m-%d')}** (typically Thursday)")
+
+    if not api_key or not str(api_key).strip():
+        st.info("Enter your EIA API key in the sidebar to auto-show the latest actual change when the report is released.")
+    else:
+        try:
+            latest_pack = fetch_eia_latest_storage_and_change(str(api_key).strip())
+            actual_chg = latest_pack.get("actual_weekly_change_bcf", None)
+
+            a1, a2, a3 = st.columns(3)
+            with a1:
+                st.metric("Forecast (market)", f"{float(eia_market_forecast_bcf):+.0f} Bcf")
+            with a2:
+                if actual_chg is None:
+                    st.metric("Actual (latest)", "N/A")
+                else:
+                    st.metric("Actual (latest)", f"{float(actual_chg):+.0f} Bcf", help=str(latest_pack.get("latest_period_date")))
+            with a3:
+                if actual_chg is None:
+                    st.metric("Surprise (actual - forecast)", "N/A")
+                else:
+                    surprise = float(actual_chg) - float(eia_market_forecast_bcf)
+                    st.metric("Surprise (actual - forecast)", f"{surprise:+.0f} Bcf")
+
+            if st.button("Refresh EIA now", help="Clears cached EIA fetch and reloads latest numbers."):
+                fetch_eia_latest_storage_and_change.clear()
+                # Force a rerun after clearing cache (Streamlit version safe)
+                if hasattr(st, 'rerun'):
+                    st.rerun()
+                elif hasattr(st, 'experimental_rerun'):
+                    st.experimental_rerun()
+        except Exception as _e:
+            st.warning(f"Could not load latest EIA actual automatically: {_e}")
+
+    # -----------------------------
+    # Contango / Backwardation check (Front vs Next contract)
+    # -----------------------------
+
+
+
+# --- EIA report forecast (date + actual, auto-updates) ---
+
     try:
         stor = fetch_eia_series(EIA_SERIES_TOTAL_R48, api_key=api_key)
         stor = compute_weekly_change(stor)
+
+        # --- Actual (last week) + Forecast (next week) table ---
+        s = stor.dropna(subset=["value"]).sort_values("date").copy()
+
+        latest_row = s.iloc[-1]
+        prev_row = s.iloc[-2] if len(s) >= 2 else None
+
+        latest_storage = float(latest_row["value"])
+        latest_date = latest_row["date"].date()
+
+        # Actual weekly change (last reported week)
+        actual_change = None
+        if prev_row is not None:
+            actual_change = float(latest_row["value"] - float(prev_row["value"]))
+
+        # Next week forecast (your manual input)
+        forecast_next_change = float(eia_market_forecast_bcf)
+
+        # Projected next week storage (latest storage + forecast change)
+        projected_next_storage = latest_storage + forecast_next_change
+
+        rows = []
+        rows.append({
+            "Week": str(latest_date),
+            "Type": "Last week (Actual)",
+            "Change (BCF)": "N/A" if actual_change is None else f"{actual_change:+.0f}",
+            "Storage (BCF)": f"{latest_storage:.0f}",
+        })
+        rows.append({
+            "Week": "Next week",
+            "Type": "Forecast (Manual input)",
+            "Change (BCF)": f"{forecast_next_change:+.0f}",
+            "Storage (BCF)": f"{projected_next_storage:.0f}",
+        })
+
+        st.markdown("### EIA Report — Actual (Last Week) vs Forecast (Next Week)")
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        if actual_change is not None:
+            surprise2 = actual_change - forecast_next_change
+            st.caption(f"Surprise (Actual - Forecast): {surprise2:+.0f} Bcf")
+
 
         latest = stor.dropna(subset=["value"]).iloc[-1]
         prev = stor.dropna(subset=["value"]).iloc[-2] if len(stor) >= 2 else None
@@ -625,6 +748,8 @@ with tabs[1]:
             m3.metric("Weekly Change (BCF)", f"{delta:+.0f}", help="Positive=injection, negative=withdrawal")
         else:
             m3.metric("Weekly Change (BCF)", "n/a")
+
+        # Market forecast (manual) for next EIA report
 
         st.markdown("### Storage (BCF)")
         st.dataframe(stor.tail(104), use_container_width=True, hide_index=True)  # last ~2 years
@@ -988,8 +1113,19 @@ with tabs[3]:
     c1.metric("Today", today.strftime("%Y-%m-%d"))
     c2.metric("Front (delivery) month", f"{y}-{m:02d}  ({ng_symbol(y,m)})")
     c3.metric("Estimated expiry", exp.strftime("%Y-%m-%d"))
+
+    # Rollover month name (auto-updates)
+    roll_month_name = dt.date(y, m, 1).strftime("%B %Y")
+    st.metric("Rollover Month", roll_month_name)
+
+
+    c4, c5 = st.columns(2)
+    c4.metric("Rollover start date", roll_start.strftime("%Y-%m-%d"))
+    c5.metric("Rollover end date (expiry)", exp.strftime("%Y-%m-%d"))
+
+
     # -----------------------------
-    # Contango / Backwardation check (Front vs Next contract)
+    # EIA Storage Report — forecast vs actual (shown ONLY on this page)
     # -----------------------------
     st.markdown("### Curve check: Next contract contango or backwardation?")
 
