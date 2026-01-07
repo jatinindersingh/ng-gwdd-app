@@ -14,6 +14,7 @@ import requests
 import streamlit as st
 import numpy as np
 
+
 # -----------------------------
 # Helpers
 # -----------------------------
@@ -119,65 +120,93 @@ EIA_SERIES_TOTAL_R48 = "NG.NW2_EPG0_SWO_R48_BCF.W"  # Total Lower 48, Working ga
 @st.cache_data(ttl=60 * 60 * 6, show_spinner=False)  # 6 hours
 def fetch_eia_series(series_id: str, api_key: str) -> pd.DataFrame:
     """
-    Fetch EIA data using the SeriesID endpoint (EIA API v2).
-    Endpoint format:
-      https://api.eia.gov/v2/seriesid/{SERIES_ID}?api_key=YOUR_KEY
-
+    Fetch EIA data for a single Series ID.
+    Tries multiple endpoints for compatibility (API v2 SeriesID + legacy v1 fallback).
     Returns DataFrame with:
       date (datetime), value (float)
     """
-    if not api_key:
+    if not api_key or not str(api_key).strip():
         raise ValueError("Missing EIA API key. Put it in the sidebar (or set EIA_API_KEY env var).")
 
-    url = f"https://api.eia.gov/v2/seriesid/{series_id}"
-    r = requests.get(url, params={"api_key": api_key}, timeout=30)
-    # If key is wrong, EIA often returns 403/400 with message
-    r.raise_for_status()
-    js = r.json()
+    series_id = str(series_id).strip()
+    api_key = str(api_key).strip()
 
-    # Typical v2 shape:
-    # { "response": { "data": [ {"period":"2026-01-03","value":1234}, ... ] } }
-    resp = js.get("response") or {}
-    data = resp.get("data")
+    # Endpoints to try (EIA has multiple compatible patterns over time)
+    attempts = [
+        ("v2_path", f"https://api.eia.gov/v2/seriesid/{series_id}", {"api_key": api_key}),
+        ("v2_query", "https://api.eia.gov/v2/seriesid/", {"api_key": api_key, "series_id": series_id}),
+        ("v2_query_noslash", "https://api.eia.gov/v2/seriesid", {"api_key": api_key, "series_id": series_id}),
+        # Legacy v1 fallback (may still work for some keys/series)
+        ("v1_legacy", "https://api.eia.gov/series/", {"api_key": api_key, "series_id": series_id}),
+    ]
 
-    # Some edge cases (older shapes) might be:
-    # { "series": [ {"data":[["20260103",1234], ... ] } ] }
-    if isinstance(data, list):
-        rows = []
-        for row in data:
-            period = row.get("period") or row.get("date")
-            val = row.get("value")
-            if period is None:
+    last_err: Exception | None = None
+    js = None
+
+    for _name, url, params in attempts:
+        try:
+            r = requests.get(url, params=params, timeout=30)
+            r.raise_for_status()
+            js = r.json()
+            # Basic sanity: must have some expected keys
+            if isinstance(js, dict) and ("response" in js or "series" in js):
+                break
+        except Exception as e:
+            last_err = e
+            js = None
+
+    if js is None:
+        raise RuntimeError(f"EIA request failed for series '{series_id}'. Last error: {last_err}")
+
+    data_rows = None
+
+    # API v2 expected shape:
+    # { "response": { "data": [ {"period":"2026-01-03","value":"1234"}, ... ] } }
+    if isinstance(js, dict) and "response" in js and isinstance(js["response"], dict):
+        resp = js["response"]
+        if "data" in resp and isinstance(resp["data"], list):
+            data_rows = resp["data"]
+
+    # Legacy v1 expected shape:
+    # { "series": [ { "data": [ ["20260103", 1234], ... ] } ] }
+    if data_rows is None and isinstance(js, dict) and "series" in js and isinstance(js["series"], list) and js["series"]:
+        s0 = js["series"][0]
+        if isinstance(s0, dict) and "data" in s0 and isinstance(s0["data"], list):
+            # Convert v1 format to v2-like rows
+            converted = []
+            for item in s0["data"]:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    converted.append({"period": item[0], "value": item[1]})
+            data_rows = converted
+
+    if not data_rows:
+        raise RuntimeError(f"No data returned from EIA for series '{series_id}'. Check your API key and series id.")
+
+    df = pd.DataFrame(data_rows)
+
+    # Normalize column names
+    if "period" in df.columns:
+        df = df.rename(columns={"period": "date"})
+    if "value" not in df.columns:
+        # Some routes may use "data" or other naming - fail clearly
+        raise RuntimeError(f"Unexpected EIA response columns for '{series_id}': {list(df.columns)}")
+
+    # Parse date formats (weekly often 'YYYY-MM-DD', legacy sometimes 'YYYYMMDD')
+    def _parse_date(x: str) -> dt.datetime:
+        x = str(x)
+        for fmt in ("%Y-%m-%d", "%Y%m%d", "%Y-%m", "%Y"):
+            try:
+                return dt.datetime.strptime(x, fmt)
+            except Exception:
                 continue
-            # period might be YYYY-MM-DD or YYYYMMDD
-            p = str(period)
-            if len(p) == 8 and p.isdigit():
-                d = dt.datetime.strptime(p, "%Y%m%d").date()
-            else:
-                d = pd.to_datetime(p).date()
-            rows.append((d, safe_float(val)))
-        df = pd.DataFrame(rows, columns=["date", "value"])
-    else:
-        series = js.get("series") or []
-        rows = []
-        for s in series:
-            for p, v in s.get("data", []):
-                p = str(p)
-                if len(p) == 8 and p.isdigit():
-                    d = dt.datetime.strptime(p, "%Y%m%d").date()
-                else:
-                    d = pd.to_datetime(p).date()
-                rows.append((d, safe_float(v)))
-        df = pd.DataFrame(rows, columns=["date", "value"])
+        # last resort: pandas
+        return pd.to_datetime(x, errors="coerce").to_pydatetime()
 
-    if df.empty:
-        raise ValueError("EIA returned no data for this series. Check series id / API key.")
+    df["date"] = df["date"].apply(_parse_date)
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
 
-    df = df.dropna(subset=["value"]).drop_duplicates(subset=["date"]).sort_values("date")
-    df["date"] = pd.to_datetime(df["date"])
+    df = df.dropna(subset=["date", "value"]).sort_values("date").reset_index(drop=True)
     return df
-
-
 def compute_weekly_change(storage_df: pd.DataFrame) -> pd.DataFrame:
     """
     Adds weekly injection/withdrawal (difference) column.
@@ -248,6 +277,12 @@ with st.sidebar:
         type="password",
         help="Get a key from EIA. Tip: you can set an environment variable EIA_API_KEY.",
     )
+
+
+auto_refresh = st.checkbox("Auto refresh every 1 minute", value=False)
+if auto_refresh:
+    # Browser meta-refresh (no extra packages needed)
+    st.markdown("<meta http-equiv='refresh' content='60'>", unsafe_allow_html=True)
 
 tabs = st.tabs(["GWDD Dashboard", "EIA Storage Dashboard", "Signals & Summary"])
 
