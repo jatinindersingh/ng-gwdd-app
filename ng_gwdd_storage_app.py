@@ -518,6 +518,48 @@ GLOBAL_DEMAND_REGIONS = pd.DataFrame(
 # -----------------------------
 st.set_page_config(page_title="NG USA GWDD + Storage", layout="wide")
 
+# -----------------------------
+# Responsive UI (Mobile + Desktop) - ADD ONLY
+# -----------------------------
+st.markdown(
+    """
+    <style>
+    /* Reduce top padding on all devices */
+    .block-container { padding-top: 1rem; padding-bottom: 3rem; }
+
+    /* Make tables/plots use full width and allow horizontal scroll when needed */
+    [data-testid="stDataFrame"] { width: 100% !important; }
+    div[data-testid="stDataFrame"] > div { overflow-x: auto !important; }
+
+    /* Improve metric readability */
+    div[data-testid="metric-container"] { padding: 10px 12px; border-radius: 12px; }
+
+    /* --- Mobile tweaks --- */
+    @media (max-width: 768px) {
+        .block-container { padding-left: 0.7rem; padding-right: 0.7rem; }
+        h1 { font-size: 1.35rem !important; }
+        h2 { font-size: 1.15rem !important; }
+        h3 { font-size: 1.05rem !important; }
+        p, li, span, div { font-size: 0.95rem !important; }
+
+        /* Sidebar: keep usable on small screens */
+        section[data-testid="stSidebar"] { width: 85vw !important; }
+
+        /* Buttons full width on mobile */
+        div.stButton > button { width: 100% !important; }
+
+        /* Charts: avoid huge margins */
+        .stPlotlyChart, .stAltairChart, .stVegaLiteChart { width: 100% !important; }
+
+        /* Expanders: more compact */
+        details { border-radius: 12px; }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+
 st.title("NG USA — GWDD (All Cities) + EIA Storage (Injection/Withdrawal)")
 
 with st.sidebar:
@@ -1078,6 +1120,30 @@ with tabs[1]:
         if actual_change is not None:
             surprise2 = actual_change - forecast_next_change
             st.caption(f"Surprise (Actual - Forecast): {surprise2:+.0f} Bcf")
+
+        # --- Projected real-time inventory (intraweek estimate; ADD-ONLY) ---
+        st.markdown("### Projected real-time inventory (intraweek estimate)")
+        try:
+            last_report_date = latest_pack.get("latest_period_date", latest_date)
+            last_storage = float(latest_pack.get("latest_storage_bcf", latest_storage))
+        except Exception:
+            last_report_date = latest_date
+            last_storage = latest_storage
+
+        total_days = max(1, (next_report_date - last_report_date).days)
+        days_passed = (dt.date.today() - last_report_date).days
+        frac = min(1.0, max(0.0, days_passed / total_days))
+
+        intraweek_storage = last_storage + (forecast_next_change * frac)
+        progress_pct = frac * 100.0
+
+        p1, p2, p3 = st.columns(3)
+        p1.metric("Intraweek projected storage (BCF)", f"{intraweek_storage:.0f}")
+        p2.metric("Progress to next EIA (%)", f"{progress_pct:.0f}%")
+        p3.metric("Projected next-week storage (BCF)", f"{projected_next_storage:.0f}")
+
+        st.caption("Note: This is an *estimate* that linearly phases the upcoming forecast change from the last EIA level to the next report date. "
+                   "True inventories are not published in real time; EIA releases weekly data.")
 
 
         latest = stor.dropna(subset=["value"]).iloc[-1]
