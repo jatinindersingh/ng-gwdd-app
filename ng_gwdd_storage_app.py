@@ -13,6 +13,7 @@ import pandas as pd
 import requests
 import streamlit as st
 import numpy as np
+import matplotlib.pyplot as plt
 
 # Optional market data (front-month NG)
 try:
@@ -116,6 +117,86 @@ def fetch_open_meteo_daily(lat: float, lon: float, days: int = 10) -> pd.DataFra
     df = pd.DataFrame({"date": pd.to_datetime(times), "temp_c": temps_c})
     df["temp_f"] = df["temp_c"].map(c_to_f)
     return df
+
+
+@st.cache_data(ttl=60 * 30, show_spinner=False)  # 30 minutes
+def fetch_open_meteo_daily_model(lat: float, lon: float, days: int = 14, model: str | None = None) -> pd.DataFrame:
+    """
+    Fetch daily mean temperature from Open-Meteo with an optional model selector.
+    If 'model' is None, Open-Meteo default model selection is used.
+    """
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "daily": "temperature_2m_mean",
+        "forecast_days": int(days),
+        "timezone": "UTC",
+    }
+    if model:
+        params["models"] = model
+
+    r = requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
+    js = r.json()
+
+    daily = js.get("daily", {})
+    times = daily.get("time", [])
+    temps_c = daily.get("temperature_2m_mean", [])
+    if not times or not temps_c or len(times) != len(temps_c):
+        raise ValueError("Open-Meteo returned empty daily temperature data.")
+
+    df = pd.DataFrame({"date": pd.to_datetime(times), "temp_c": temps_c})
+    df["temp_f"] = df["temp_c"].map(c_to_f)
+    return df
+
+
+def _try_models_for_city(lat: float, lon: float, days: int, model_candidates: list[str], label: str) -> pd.DataFrame:
+    """
+    Try a list of Open-Meteo model codes and return the first that works.
+    Falls back to default Open-Meteo selection if all model codes fail.
+    """
+    last_err = None
+    for mc in model_candidates:
+        try:
+            return fetch_open_meteo_daily_model(lat, lon, days=days, model=mc)
+        except Exception as e:
+            last_err = e
+            continue
+    # Fallback (no model param)
+    try:
+        return fetch_open_meteo_daily_model(lat, lon, days=days, model=None)
+    except Exception as e:
+        raise RuntimeError(f"Could not fetch {label} data for ({lat},{lon}). Last errors: {last_err} / {e}")
+
+
+def build_model_weighted_gwdd(cities_df: pd.DataFrame, base_f: float, days: int, model_key: str) -> pd.DataFrame:
+    """
+    Build gas-weighted GWDD outlook (day 1-14) for a given model using the existing city weights.
+    Returns: date, gwdd
+    """
+    # Model code candidates (Open-Meteo model names can vary; we try a few common ones)
+    model_map = {
+        "gfs_op": ["gfs_seamless", "gfs"],
+        "gfs_ens": ["gfs_ensemble", "gefs"],
+        "ecmwf_ens": ["ecmwf_ensemble", "ecmwf"],
+    }
+    candidates = model_map.get(model_key, [])
+    rows = []
+    for _, row in cities_df.iterrows():
+        lat = float(row["lat"])
+        lon = float(row["lon"])
+        w = float(row.get("weight", 1.0))
+        df_t = _try_models_for_city(lat, lon, days=days, model_candidates=candidates, label=model_key)
+        gw = compute_gwdd(df_t, base_f=base_f)
+        gw["w_gwdd"] = gw["gwdd"] * w
+        rows.append(gw[["date", "w_gwdd"]])
+    if not rows:
+        return pd.DataFrame(columns=["date", "gwdd"])
+    out = pd.concat(rows, ignore_index=True).groupby("date", as_index=False)["w_gwdd"].sum()
+    out = out.rename(columns={"w_gwdd": "gwdd"}).sort_values("date")
+    return out
+
 
 
 def compute_gwdd(df_daily: pd.DataFrame, base_f: float = 65.0) -> pd.DataFrame:
@@ -745,6 +826,167 @@ with tabs[0]:
 # -----------------------------
 # Tab 2: EIA Storage
 # -----------------------------
+
+    # -----------------------------
+
+    # Day 1–14 Consensus Model GWDD (AUTO, ADD ONLY)
+    st.markdown("## Day 1–14 Consensus Model Gas-Weighted Degree Day (GWDD) Outlook")
+    st.caption("Auto-updated from Open-Meteo model feeds (GFS Operational, GEFS, ECMWF). Uses your existing city weights (gas demand weighting).")
+
+    auto_models = st.checkbox("Auto-update models (recommended)", value=True, help="Pulls model temperatures automatically and computes GWDD. If unchecked, you can upload CSVs.")
+    horizon_days = st.slider("Outlook days", min_value=7, max_value=14, value=14, step=1, help="Day 1–14 horizon")
+    st.markdown("### Performance weights (lower error = higher weight)")
+    colw1, colw2, colw3 = st.columns(3)
+    with colw1:
+        err_gfs_op = st.number_input("GFS Operational error score", value=1.00, step=0.05, help="Relative score (example: MAE). Smaller = better.")
+    with colw2:
+        err_gfs_ens = st.number_input("GEFS (GFS ENS) error score", value=1.10, step=0.05)
+    with colw3:
+        err_ec_ens = st.number_input("ECMWF ENS error score", value=0.95, step=0.05)
+
+    def _invw(x: float) -> float:
+        x = float(x) if x else 0.0
+        return 1.0 / x if x > 0 else 0.0
+
+    w1, w2, w3 = _invw(err_gfs_op), _invw(err_gfs_ens), _invw(err_ec_ens)
+    wsum = w1 + w2 + w3
+    if wsum <= 0:
+        w1, w2, w3 = 1/3, 1/3, 1/3
+        wsum = 1.0
+    w1, w2, w3 = w1/wsum, w2/wsum, w3/wsum
+    st.caption(f"Consensus weights → GFS Op: {w1:.2f} | GEFS: {w2:.2f} | ECMWF ENS: {w3:.2f}")
+
+    st.markdown("### (Optional) 5-year average GWDD line")
+    avg5_file = st.file_uploader("Upload 5-year average GWDD CSV (date, avg_gwdd)", type=["csv"], key="avg5_gwdd")
+    avg5 = None
+    if avg5_file:
+        avg5 = pd.read_csv(avg5_file)
+        # Normalize columns
+        cols = [c.lower().strip() for c in avg5.columns]
+        avg5.columns = cols
+        if "date" in avg5.columns:
+            avg5["date"] = pd.to_datetime(avg5["date"], errors="coerce")
+        if "avg_gwdd" not in avg5.columns:
+            # accept common names
+            for alt in ["gwdd", "avg", "value"]:
+                if alt in avg5.columns:
+                    avg5 = avg5.rename(columns={alt: "avg_gwdd"})
+                    break
+        avg5 = avg5.dropna(subset=["date", "avg_gwdd"]).sort_values("date")[["date", "avg_gwdd"]]
+
+    st.divider()
+
+    if auto_models:
+        with st.spinner("Auto-updating: fetching model temperatures and building GWDD outlook..."):
+            try:
+                gfs_op = build_model_weighted_gwdd(cities_df, base_f=base_f, days=horizon_days, model_key="gfs_op").rename(columns={"gwdd": "gfs_op_gwdd"})
+                gfs_ens = build_model_weighted_gwdd(cities_df, base_f=base_f, days=horizon_days, model_key="gfs_ens").rename(columns={"gwdd": "gfs_ens_gwdd"})
+                ec_ens = build_model_weighted_gwdd(cities_df, base_f=base_f, days=horizon_days, model_key="ecmwf_ens").rename(columns={"gwdd": "ecmwf_ens_gwdd"})
+
+                merged = gfs_op.merge(gfs_ens, on="date", how="outer").merge(ec_ens, on="date", how="outer").sort_values("date")
+            except Exception as e:
+                st.error(f"Auto model update failed: {e}")
+                merged = None
+    else:
+        st.info("Upload model GWDD CSVs (date, gwdd) to build the consensus.")
+        gfs_op_file = st.file_uploader("Upload GFS Operational GWDD CSV", type=["csv"], key="gfs_op_csv")
+        gfs_ens_file = st.file_uploader("Upload GFS ENS (GEFS) GWDD CSV", type=["csv"], key="gfs_ens_csv")
+        ecmwf_ens_file = st.file_uploader("Upload ECMWF ENS GWDD CSV", type=["csv"], key="ecmwf_ens_csv")
+
+        def _read_model_gwdd_csv(file_obj) -> pd.DataFrame:
+            df = pd.read_csv(file_obj)
+            # normalize columns
+            df.columns = [c.lower().strip() for c in df.columns]
+            if "date" not in df.columns:
+                raise ValueError("CSV missing 'date' column.")
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            # accept gwdd/value
+            if "gwdd" not in df.columns:
+                for alt in ["wgwdd", "value", "gwdd_overall_weighted", "gas_weighted_gwdd"]:
+                    if alt in df.columns:
+                        df = df.rename(columns={alt: "gwdd"})
+                        break
+            if "gwdd" not in df.columns:
+                raise ValueError("CSV missing 'gwdd' column (accepted: gwdd, wgwdd, value, gwdd_overall_weighted).")
+            df["gwdd"] = pd.to_numeric(df["gwdd"], errors="coerce")
+            return df.dropna(subset=["date", "gwdd"]).sort_values("date")[["date", "gwdd"]]
+
+        frames = []
+        if gfs_op_file:
+            frames.append(_read_model_gwdd_csv(gfs_op_file).rename(columns={"gwdd": "gfs_op_gwdd"}))
+        if gfs_ens_file:
+            frames.append(_read_model_gwdd_csv(gfs_ens_file).rename(columns={"gwdd": "gfs_ens_gwdd"}))
+        if ecmwf_ens_file:
+            frames.append(_read_model_gwdd_csv(ecmwf_ens_file).rename(columns={"gwdd": "ecmwf_ens_gwdd"}))
+
+        merged = None
+        if frames:
+            merged = frames[0]
+            for f in frames[1:]:
+                merged = merged.merge(f, on="date", how="outer")
+            merged = merged.sort_values("date")
+
+    if merged is not None and not merged.empty:
+        # Consensus
+        merged["consensus_gwdd"] = (
+            merged.get("gfs_op_gwdd") * w1 +
+            merged.get("gfs_ens_gwdd") * w2 +
+            merged.get("ecmwf_ens_gwdd") * w3
+        )
+
+        # Limit to horizon
+        merged = merged.sort_values("date").head(horizon_days)
+
+        st.markdown("### 1) Daily GWDDs (bars) + 5-year average (line)")
+        top = merged[["date", "consensus_gwdd"]].copy()
+        top["date_label"] = top["date"].dt.strftime("%b-%d")
+
+        # Display numbers similar to your screenshot
+        cols = st.columns(3)
+        cols[0].metric("Day 1 GWDD", f"{float(top['consensus_gwdd'].iloc[0]):.0f}")
+        cols[1].metric("Peak (1–14)", f"{float(top['consensus_gwdd'].max()):.0f}")
+        cols[2].metric("Avg (1–14)", f"{float(top['consensus_gwdd'].mean()):.0f}")
+
+        # Chart (bar = consensus)
+        chart_df = top.set_index("date")[["consensus_gwdd"]]
+        st.bar_chart(chart_df)
+
+        # Optional avg line + departures
+        if avg5 is not None and not avg5.empty:
+            # Align by date (merge)
+            a = avg5.copy()
+            a = a.rename(columns={"avg_gwdd": "avg5_gwdd"})
+            comp = merged.merge(a, on="date", how="left")
+            st.line_chart(comp.set_index("date")[["avg5_gwdd"]])
+
+            st.markdown("### 2) Departure From Normal (Consensus − 5Y Avg)")
+            comp["departure"] = comp["consensus_gwdd"] - comp["avg5_gwdd"]
+            dep = comp.dropna(subset=["departure"])[["date", "departure"]].set_index("date")
+            st.bar_chart(dep)
+        else:
+            st.info("Upload 5-year average GWDD CSV to show the red average line + departure-from-normal chart (exact like your example).")
+
+        st.markdown("### 3) 12-Hour Trend (proxy: change vs last run)")
+        # Store previous run in session_state to compute changes
+        prev = st.session_state.get("_prev_consensus_series")
+        cur = merged[["date", "consensus_gwdd"]].copy()
+        if prev is not None and isinstance(prev, pd.DataFrame) and not prev.empty:
+            tmp = cur.merge(prev, on="date", how="left", suffixes=("", "_prev"))
+            tmp["trend_change"] = tmp["consensus_gwdd"] - tmp["consensus_gwdd_prev"]
+            tr = tmp.dropna(subset=["trend_change"])[["date", "trend_change"]].set_index("date")
+            st.bar_chart(tr)
+        else:
+            st.info("Trend chart will appear after the next refresh (it compares against the previous run).")
+
+        st.session_state["_prev_consensus_series"] = cur
+
+        with st.expander("Show table (models + consensus)"):
+            show_cols = [c for c in ["date", "gfs_op_gwdd", "gfs_ens_gwdd", "ecmwf_ens_gwdd", "consensus_gwdd"] if c in merged.columns]
+            st.dataframe(merged[show_cols], use_container_width=True, hide_index=True)
+    else:
+        st.warning("No model data available yet. Turn on Auto-update OR upload model CSVs.")
+
+
 with tabs[1]:
     st.subheader("EIA Weekly Natural Gas Storage (BCF) + Weekly Injection/Withdrawal")
 
