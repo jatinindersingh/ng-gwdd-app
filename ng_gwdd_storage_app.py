@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import os
 import math
+import json
+from pathlib import Path
 import datetime as dt
 from typing import Dict, List, Tuple
 
@@ -44,6 +46,47 @@ def fetch_yahoo_last_price(ticker: str) -> float | None:
 # -----------------------------
 # Helpers
 # -----------------------------
+
+# --- EIA forecast storage (for correct Surprise: Actual - Forecast for the SAME report week)
+_FORECAST_STORE = Path("eia_forecasts.json")
+
+def _load_eia_forecasts() -> dict:
+    try:
+        if _FORECAST_STORE.exists():
+            return json.loads(_FORECAST_STORE.read_text())
+    except Exception:
+        pass
+    return {}
+
+def _save_eia_forecasts(data: dict) -> None:
+    try:
+        _FORECAST_STORE.write_text(json.dumps(data, indent=2))
+    except Exception:
+        # If write fails (read-only env), fall back to session_state
+        st.session_state["_eia_forecasts_fallback"] = data
+
+def _get_saved_forecast(report_date: dt.date) -> float | None:
+    key = report_date.isoformat()
+    data = _load_eia_forecasts()
+    if key in data:
+        try:
+            return float(data[key])
+        except Exception:
+            return None
+    # fallback
+    fb = st.session_state.get("_eia_forecasts_fallback", {})
+    if isinstance(fb, dict) and key in fb:
+        try:
+            return float(fb[key])
+        except Exception:
+            return None
+    return None
+
+def _set_saved_forecast(report_date: dt.date, forecast_bcf: float) -> None:
+    key = report_date.isoformat()
+    data = _load_eia_forecasts()
+    data[key] = float(forecast_bcf)
+    _save_eia_forecasts(data)
 def fetch_eia_storage_us_total(api_key):
     """
     Fetch latest US working gas in storage (BCF)
@@ -517,48 +560,6 @@ GLOBAL_DEMAND_REGIONS = pd.DataFrame(
 # Streamlit UI
 # -----------------------------
 st.set_page_config(page_title="NG USA GWDD + Storage", layout="wide")
-
-# -----------------------------
-# Responsive UI (Mobile + Desktop) - ADD ONLY
-# -----------------------------
-st.markdown(
-    """
-    <style>
-    /* Reduce top padding on all devices */
-    .block-container { padding-top: 1rem; padding-bottom: 3rem; }
-
-    /* Make tables/plots use full width and allow horizontal scroll when needed */
-    [data-testid="stDataFrame"] { width: 100% !important; }
-    div[data-testid="stDataFrame"] > div { overflow-x: auto !important; }
-
-    /* Improve metric readability */
-    div[data-testid="metric-container"] { padding: 10px 12px; border-radius: 12px; }
-
-    /* --- Mobile tweaks --- */
-    @media (max-width: 768px) {
-        .block-container { padding-left: 0.7rem; padding-right: 0.7rem; }
-        h1 { font-size: 1.35rem !important; }
-        h2 { font-size: 1.15rem !important; }
-        h3 { font-size: 1.05rem !important; }
-        p, li, span, div { font-size: 0.95rem !important; }
-
-        /* Sidebar: keep usable on small screens */
-        section[data-testid="stSidebar"] { width: 85vw !important; }
-
-        /* Buttons full width on mobile */
-        div.stButton > button { width: 100% !important; }
-
-        /* Charts: avoid huge margins */
-        .stPlotlyChart, .stAltairChart, .stVegaLiteChart { width: 100% !important; }
-
-        /* Expanders: more compact */
-        details { border-radius: 12px; }
-    }
-    </style>
-    """,
-    unsafe_allow_html=True
-)
-
 
 st.title("NG USA — GWDD (All Cities) + EIA Storage (Injection/Withdrawal)")
 
@@ -1036,6 +1037,16 @@ with tabs[1]:
     next_report_date = estimate_next_eia_report_date(dt.date.today())
     st.caption(f"Estimated next report date: **{next_report_date.strftime('%Y-%m-%d')}** (typically Thursday)")
 
+    # Save the market forecast for the upcoming report week (so Surprise is computed correctly later)
+    colsf1, colsf2 = st.columns([1, 2])
+    with colsf1:
+        if st.button("Save forecast for next EIA week"):
+            _set_saved_forecast(next_report_date, float(eia_market_forecast_bcf))
+            st.success(f"Saved forecast for {next_report_date.isoformat()}: {float(eia_market_forecast_bcf):+.0f} Bcf")
+    with colsf2:
+        st.caption("Tip: save forecast before EIA release. After the report prints, the app will use the saved forecast for that same week to compute Surprise.")
+
+
     if not api_key or not str(api_key).strip():
         st.info("Enter your EIA API key in the sidebar to auto-show the latest actual change when the report is released.")
     else:
@@ -1055,8 +1066,13 @@ with tabs[1]:
                 if actual_chg is None:
                     st.metric("Surprise (actual - forecast)", "N/A")
                 else:
-                    surprise = float(actual_chg) - float(eia_market_forecast_bcf)
-                    st.metric("Surprise (actual - forecast)", f"{surprise:+.0f} Bcf")
+                    ld = latest_pack.get("latest_period_date")
+                    saved_fc = _get_saved_forecast(ld) if ld else None
+                    if saved_fc is None:
+                        st.metric("Surprise (actual - forecast)", "N/A", help="Save forecast for that same report week to compute surprise correctly.")
+                    else:
+                        surprise = float(actual_chg) - float(saved_fc)
+                        st.metric("Surprise (actual - forecast)", f"{surprise:+.0f} Bcf")
 
             if st.button("Refresh EIA now", help="Clears cached EIA fetch and reloads latest numbers."):
                 fetch_eia_latest_storage_and_change.clear()
@@ -1118,32 +1134,12 @@ with tabs[1]:
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
         if actual_change is not None:
-            surprise2 = actual_change - forecast_next_change
-            st.caption(f"Surprise (Actual - Forecast): {surprise2:+.0f} Bcf")
-
-        # --- Projected real-time inventory (intraweek estimate; ADD-ONLY) ---
-        st.markdown("### Projected real-time inventory (intraweek estimate)")
-        try:
-            last_report_date = latest_pack.get("latest_period_date", latest_date)
-            last_storage = float(latest_pack.get("latest_storage_bcf", latest_storage))
-        except Exception:
-            last_report_date = latest_date
-            last_storage = latest_storage
-
-        total_days = max(1, (next_report_date - last_report_date).days)
-        days_passed = (dt.date.today() - last_report_date).days
-        frac = min(1.0, max(0.0, days_passed / total_days))
-
-        intraweek_storage = last_storage + (forecast_next_change * frac)
-        progress_pct = frac * 100.0
-
-        p1, p2, p3 = st.columns(3)
-        p1.metric("Intraweek projected storage (BCF)", f"{intraweek_storage:.0f}")
-        p2.metric("Progress to next EIA (%)", f"{progress_pct:.0f}%")
-        p3.metric("Projected next-week storage (BCF)", f"{projected_next_storage:.0f}")
-
-        st.caption("Note: This is an *estimate* that linearly phases the upcoming forecast change from the last EIA level to the next report date. "
-                   "True inventories are not published in real time; EIA releases weekly data.")
+            saved_fc2 = _get_saved_forecast(latest_date)
+            if saved_fc2 is None:
+                st.caption("Surprise (Actual - Forecast): N/A (save forecast for the same report week)")
+            else:
+                surprise2 = float(actual_change) - float(saved_fc2)
+                st.caption(f"Surprise (Actual - Forecast): {surprise2:+.0f} Bcf")
 
 
         latest = stor.dropna(subset=["value"]).iloc[-1]
