@@ -1329,6 +1329,65 @@ def _project_next_week_storage(storage_df_with_change: pd.DataFrame, method: str
     return out
 
 
+
+# -----------------------------
+# One Signal (BUY / HOLD / SELL) — uses Weather/GWDD + EIA + Injection/Withdrawal
+# (Add-only: does not change existing logic)
+# -----------------------------
+def _ng_one_signal(gwdd_slope: float | None, eia_surprise: float | None, weekly_change_bcf: float | None) -> dict:
+    """Returns a compact NG signal with an action suggestion.
+    Scoring (simple + robust):
+      - GWDD slope: rising colder demand -> bullish, falling -> bearish
+      - EIA surprise (Actual - Forecast, same week): negative -> bullish, positive -> bearish
+      - Weekly change: big withdrawal -> bullish, big injection -> bearish
+    """
+    score = 0
+    reasons = []
+
+    # GWDD slope
+    if gwdd_slope is not None:
+        if gwdd_slope > 0.15:
+            score += 2
+            reasons.append(f"GWDD trend rising (slope {gwdd_slope:+.2f}/day)")
+        elif gwdd_slope < -0.15:
+            score -= 2
+            reasons.append(f"GWDD trend falling (slope {gwdd_slope:+.2f}/day)")
+        else:
+            reasons.append(f"GWDD trend mixed (slope {gwdd_slope:+.2f}/day)")
+
+    # EIA surprise (same report week)
+    if eia_surprise is not None:
+        if eia_surprise <= -10:
+            score += 2
+            reasons.append(f"EIA bullish surprise ({eia_surprise:+.0f} Bcf)")
+        elif eia_surprise >= 10:
+            score -= 2
+            reasons.append(f"EIA bearish surprise ({eia_surprise:+.0f} Bcf)")
+        else:
+            reasons.append(f"EIA surprise small ({eia_surprise:+.0f} Bcf)")
+
+    # Weekly injection/withdrawal
+    if weekly_change_bcf is not None:
+        if weekly_change_bcf <= -80:
+            score += 1
+            reasons.append(f"Big withdrawal ({weekly_change_bcf:+.0f} Bcf)")
+        elif weekly_change_bcf >= 80:
+            score -= 1
+            reasons.append(f"Big injection ({weekly_change_bcf:+.0f} Bcf)")
+        else:
+            reasons.append(f"Moderate storage change ({weekly_change_bcf:+.0f} Bcf)")
+
+    if score >= 3:
+        signal = "BULLISH"
+        action = "BUY / HOLD"
+    elif score <= -3:
+        signal = "BEARISH"
+        action = "SELL / AVOID"
+    else:
+        signal = "NEUTRAL"
+        action = "HOLD / WAIT"
+
+    return {"signal": signal, "action": action, "score": score, "reasons": reasons}
 with tabs[2]:
     st.header("Signals & Summary")
     st.divider()
@@ -1371,6 +1430,46 @@ with tabs[2]:
 
     signal = _compute_ng_signal(overall, storage_with_change)
 
+
+# --- NEW: One compact NG signal (BUY / HOLD / SELL) ---
+# Compute EIA surprise (Actual - saved forecast) for the SAME report week, if available.
+eia_surprise_same_week = None
+if api_key and str(api_key).strip():
+    try:
+        _lp = fetch_eia_latest_storage_and_change(str(api_key).strip())
+        _ld = _lp.get("latest_period_date")
+        _ac = _lp.get("actual_weekly_change_bcf", None)
+        if _ld and (_ac is not None):
+            _saved = _get_saved_forecast(_ld)
+            if _saved is not None:
+                eia_surprise_same_week = float(_ac) - float(_saved)
+    except Exception:
+        eia_surprise_same_week = None
+
+one = _ng_one_signal(
+    gwdd_slope=signal.get("gwdd_slope", None),
+    eia_surprise=eia_surprise_same_week,
+    weekly_change_bcf=signal.get("latest_weekly_change_bcf", None),
+)
+
+st.subheader("NG One-Signal (Weather + EIA + Storage)")
+cA, cB, cC = st.columns(3)
+cA.metric("Signal", one["signal"])
+cB.metric("Action", one["action"])
+cC.metric("Score", one["score"])
+
+if one["signal"] == "BULLISH":
+    st.success(f"NG SIGNAL: **{one['signal']} → {one['action']}**")
+elif one["signal"] == "BEARISH":
+    st.error(f"NG SIGNAL: **{one['signal']} → {one['action']}**")
+else:
+    st.warning(f"NG SIGNAL: **{one['signal']} → {one['action']}**")
+
+with st.expander("Why (drivers)"):
+    for r in one["reasons"]:
+        st.write("• " + str(r))
+    if eia_surprise_same_week is None:
+        st.caption("EIA surprise is N/A until you save a forecast for the same report week and the EIA actual is released.")
     # Top signal box
     sig_text = signal["signal"]
     if sig_text.lower().startswith("bullish"):
