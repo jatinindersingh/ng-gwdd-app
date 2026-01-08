@@ -17,6 +17,12 @@ import streamlit as st
 import numpy as np
 import matplotlib.pyplot as plt
 
+# Optional RSS news feeds
+try:
+    import feedparser
+except Exception:
+    feedparser = None
+
 # Optional market data (front-month NG)
 try:
     import yfinance as yf
@@ -762,7 +768,7 @@ def front_delivery_month(today: "dt.date") -> tuple[int,int]:
         return y+1, 1
     return y, m+1
 
-tabs = st.tabs(["GWDD Dashboard", "EIA Storage Dashboard", "Signals & Summary", "Contracts & Rollover"])
+tabs = st.tabs(["GWDD Dashboard", "EIA Storage Dashboard", "Signals & Summary", "Contracts & Rollover", "NG News"])
 
 # -----------------------------
 # Tab 1: GWDD
@@ -1484,3 +1490,74 @@ If you trade **NG=F (Yahoo front month)** or CFDs, the rollover behavior can dif
     df_roll = pd.DataFrame(rows)
     st.dataframe(df_roll, use_container_width=True)
 
+
+
+
+
+# -----------------------------
+# Tab 5: NG News
+# -----------------------------
+with tabs[4]:
+    st.subheader("📰 Natural Gas News (Headlines)")
+    st.caption("Headlines only (opens sources in a new tab).")
+
+    if feedparser is None:
+        st.info("To enable this tab, install feedparser:  pip install feedparser  (then restart the app).")
+    else:
+        # Keep feeds small to stay fast
+        FEEDS = [
+            "https://www.eia.gov/rss/todayinenergy.xml",
+            "https://www.rigzone.com/news/rss/rigzone_latest.aspx",
+            "https://www.rigzone.com/news/rss/rigzone_finance.aspx",
+        ]
+
+        col1, col2 = st.columns([1, 2])
+        with col1:
+            max_items = st.number_input("Max headlines", min_value=5, max_value=50, value=25, step=5)
+        with col2:
+            keyword = st.text_input("Filter keyword (optional)", value="", help="Example: storage, LNG, Freeport, Henry Hub")
+
+        @st.cache_data(ttl=60 * 15, show_spinner=False)  # 15 min
+        def _fetch_all_news():
+            items = []
+            for url in FEEDS:
+                d = feedparser.parse(url)
+                source = getattr(getattr(d, "feed", {}), "title", "") or url
+                for e in (getattr(d, "entries", []) or []):
+                    items.append({
+                        "title": (e.get("title") or "").strip(),
+                        "link": (e.get("link") or "").strip(),
+                        "published": (e.get("published") or e.get("updated") or "").strip(),
+                        "source": source,
+                    })
+            # De-dup
+            seen = set()
+            uniq = []
+            for it in items:
+                key = (it.get("link") or "") + "|" + (it.get("title") or "")
+                if key in seen:
+                    continue
+                seen.add(key)
+                uniq.append(it)
+            return uniq
+
+        # Manual refresh button (clears cache)
+        if st.button("Refresh headlines"):
+            _fetch_all_news.clear()
+
+        uniq = _fetch_all_news()
+
+        if keyword and keyword.strip():
+            k = keyword.strip().lower()
+            uniq = [it for it in uniq if k in (it.get("title","").lower()) or k in (it.get("source","").lower())]
+
+        if not uniq:
+            st.info("No headlines found (check internet or try removing the keyword filter).")
+        else:
+            st.write(f"Showing **{min(int(max_items), len(uniq))}** headlines from {len(FEEDS)} feeds.")
+            for it in uniq[: int(max_items)]:
+                t = it.get("title") or "(no title)"
+                link = it.get("link") or ""
+                src = it.get("source") or ""
+                pub = it.get("published") or ""
+                st.markdown(f"- [{t}]({link})  \n  {src}  •  {pub}")
