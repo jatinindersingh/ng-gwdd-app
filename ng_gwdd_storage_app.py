@@ -137,7 +137,7 @@ def c_to_f(c: float) -> float:
 def fetch_open_meteo_daily(lat: float, lon: float, days: int = 10) -> pd.DataFrame:
     """
     Fetch daily temperatures from Open-Meteo.
-    We request daily mean temp in Celsius then convert to Fahrenheit for GWDD calc.
+    Fast + resilient: short timeout, silent failures -> empty DataFrame (keeps app snappy).
     """
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
@@ -147,26 +147,31 @@ def fetch_open_meteo_daily(lat: float, lon: float, days: int = 10) -> pd.DataFra
         "forecast_days": int(days),
         "timezone": "UTC",
     }
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    js = r.json()
 
-    daily = js.get("daily", {})
-    times = daily.get("time", [])
-    temps_c = daily.get("temperature_2m_mean", [])
-    if not times or not temps_c or len(times) != len(temps_c):
-        raise ValueError("Open-Meteo returned empty daily temperature data.")
+    try:
+        r = requests.get(url, params=params, timeout=8)
+        r.raise_for_status()
+        js = r.json()
 
-    df = pd.DataFrame({"date": pd.to_datetime(times), "temp_c": temps_c})
-    df["temp_f"] = df["temp_c"].map(c_to_f)
-    return df
+        daily = js.get("daily", {})
+        times = daily.get("time", [])
+        temps_c = daily.get("temperature_2m_mean", [])
+        if not times or not temps_c or len(times) != len(temps_c):
+            return pd.DataFrame(columns=["date", "temp_c", "temp_f"])
+
+        df = pd.DataFrame({"date": pd.to_datetime(times), "temp_c": temps_c})
+        df["temp_f"] = df["temp_c"].map(c_to_f)
+        return df
+    except Exception:
+        # Silent fail: keeps the UI fast when Open-Meteo has transient SSL/network issues
+        return pd.DataFrame(columns=["date", "temp_c", "temp_f"])
 
 
 @st.cache_data(ttl=60 * 30, show_spinner=False)  # 30 minutes
 def fetch_open_meteo_daily_model(lat: float, lon: float, days: int = 14, model: str | None = None) -> pd.DataFrame:
     """
     Fetch daily mean temperature from Open-Meteo with an optional model selector.
-    If 'model' is None, Open-Meteo default model selection is used.
+    Fast + resilient: short timeout, silent failures -> empty DataFrame.
     """
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
@@ -179,39 +184,46 @@ def fetch_open_meteo_daily_model(lat: float, lon: float, days: int = 14, model: 
     if model:
         params["models"] = model
 
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    js = r.json()
+    try:
+        r = requests.get(url, params=params, timeout=8)
+        r.raise_for_status()
+        js = r.json()
 
-    daily = js.get("daily", {})
-    times = daily.get("time", [])
-    temps_c = daily.get("temperature_2m_mean", [])
-    if not times or not temps_c or len(times) != len(temps_c):
-        raise ValueError("Open-Meteo returned empty daily temperature data.")
+        daily = js.get("daily", {})
+        times = daily.get("time", [])
+        temps_c = daily.get("temperature_2m_mean", [])
+        if not times or not temps_c or len(times) != len(temps_c):
+            return pd.DataFrame(columns=["date", "temp_c", "temp_f"])
 
-    df = pd.DataFrame({"date": pd.to_datetime(times), "temp_c": temps_c})
-    df["temp_f"] = df["temp_c"].map(c_to_f)
-    return df
+        df = pd.DataFrame({"date": pd.to_datetime(times), "temp_c": temps_c})
+        df["temp_f"] = df["temp_c"].map(c_to_f)
+        return df
+    except Exception:
+        return pd.DataFrame(columns=["date", "temp_c", "temp_f"])
 
 
 def _try_models_for_city(lat: float, lon: float, days: int, model_candidates: list[str], label: str) -> pd.DataFrame:
     """
     Try a list of Open-Meteo model codes and return the first that works.
-    Falls back to default Open-Meteo selection if all model codes fail.
+    Resilient behavior:
+      - If a model returns empty data, try the next model.
+      - If all models fail/empty, fall back to default selection.
+      - If still empty, return an empty DataFrame (do NOT raise) to keep UI fast.
     """
-    last_err = None
     for mc in model_candidates:
         try:
-            return fetch_open_meteo_daily_model(lat, lon, days=days, model=mc)
-        except Exception as e:
-            last_err = e
+            df = fetch_open_meteo_daily_model(lat, lon, days=days, model=mc)
+            if df is not None and not df.empty:
+                return df
+        except Exception:
             continue
+
     # Fallback (no model param)
     try:
-        return fetch_open_meteo_daily_model(lat, lon, days=days, model=None)
-    except Exception as e:
-        raise RuntimeError(f"Could not fetch {label} data for ({lat},{lon}). Last errors: {last_err} / {e}")
-
+        df = fetch_open_meteo_daily_model(lat, lon, days=days, model=None)
+        return df if df is not None else pd.DataFrame(columns=["date", "temp_c", "temp_f"])
+    except Exception:
+        return pd.DataFrame(columns=["date", "temp_c", "temp_f"])
 
 def build_model_weighted_gwdd(cities_df: pd.DataFrame, base_f: float, days: int, model_key: str) -> pd.DataFrame:
     """
@@ -555,6 +567,30 @@ GLOBAL_DEMAND_REGIONS = pd.DataFrame(
 
 
 
+# -----------------------------
+# Global NG use countries (representative demand centers)
+# (Used for Global GWDD daily table + signal)
+# -----------------------------
+GLOBAL_NG_COUNTRIES = pd.DataFrame(
+    [
+        ("United States", "Chicago, IL", 41.8781, -87.6298, 1.00),
+        ("Canada", "Toronto, ON", 43.6532, -79.3832, 0.35),
+        ("Mexico", "Monterrey", 25.6866, -100.3161, 0.25),
+        ("United Kingdom", "London", 51.5074, -0.1278, 0.30),
+        ("Germany", "Berlin", 52.5200, 13.4050, 0.30),
+        ("France", "Paris", 48.8566, 2.3522, 0.25),
+        ("Italy", "Milan", 45.4642, 9.1900, 0.22),
+        ("Spain", "Madrid", 40.4168, -3.7038, 0.18),
+        ("Netherlands", "Amsterdam", 52.3676, 4.9041, 0.18),
+        ("Japan", "Tokyo", 35.6762, 139.6503, 0.28),
+        ("South Korea", "Seoul", 37.5665, 126.9780, 0.20),
+        ("China", "Shanghai", 31.2304, 121.4737, 0.30),
+        ("India", "Delhi", 28.6139, 77.2090, 0.20),
+    ],
+    columns=["country", "city", "lat", "lon", "weight"],
+)
+
+
 
 # -----------------------------
 # Streamlit UI
@@ -726,7 +762,7 @@ def front_delivery_month(today: "dt.date") -> tuple[int,int]:
         return y+1, 1
     return y, m+1
 
-tabs = st.tabs(["GWDD Dashboard", "EIA Storage Dashboard", "Signals & Summary", "Contracts & Rollover", "NG Price Indexes & Curves"])
+tabs = st.tabs(["GWDD Dashboard", "EIA Storage Dashboard", "Signals & Summary", "Contracts & Rollover"])
 
 # -----------------------------
 # Tab 1: GWDD
@@ -757,7 +793,7 @@ with tabs[0]:
                     gw["weight"] = float(row["weight"])
                     city_frames.append(gw)
                 except Exception as e:
-                    st.warning(f"City failed: {row.get('city','?')} — {e}")
+                    pass  # city fetch failed (silenced to keep UI fast)
 
         if not city_frames:
             st.error("No city data fetched. Check internet and city lat/lon.")
@@ -783,253 +819,66 @@ with tabs[0]:
             st.dataframe(overall, use_container_width=True, hide_index=True)
             st.line_chart(overall.set_index("date")["GWDD_overall_weighted"])
 
-            st.markdown("### City-wise GWDD (Daily)")
-            pivot = all_city.pivot_table(index="date", columns="city", values="gwdd", aggfunc="mean").sort_index()
-            st.dataframe(pivot, use_container_width=True)
-            st.line_chart(pivot)
-
             st.divider()
-            st.subheader("Global demand regions — Weather forecast & GWDD (export / burn markets)")
-            st.caption("Add-on view: selected world regions where natural gas demand matters (US regions + key LNG/Mexico markets). Uses the same GWDD base you set in the sidebar.")
+            st.subheader("Global NG Countries — Daily GWDD (Country + Date)")
 
-            # Editable region list (inside the tab — does not affect your sidebar cities)
-            regions_df = st.data_editor(
-                GLOBAL_DEMAND_REGIONS,
-                num_rows="dynamic",
-                use_container_width=True,
-                column_config={
-                    "region": st.column_config.TextColumn("Region"),
-                    "lat": st.column_config.NumberColumn("Lat"),
-                    "lon": st.column_config.NumberColumn("Lon"),
-                    "weight": st.column_config.NumberColumn("Weight", help="Higher weight = more demand impact"),
-                },
-                key="global_regions_editor",
-            )
+            global_days = st.selectbox("Outlook days (Global)", [7, 14], index=1, key="global_days")
 
-            selected = st.multiselect(
-                "Select regions to include",
-                options=regions_df["region"].astype(str).tolist(),
-                default=regions_df["region"].astype(str).tolist()[:6],
-                key="global_regions_select",
-            )
+            rows = []
+            weighted_daily = {}  # date -> weighted gwdd sum
+            for _, r in GLOBAL_NG_COUNTRIES.iterrows():
+                try:
+                    df_t = fetch_open_meteo_daily(float(r["lat"]), float(r["lon"]), days=int(global_days))
+                    gw = compute_gwdd(df_t, base_f=base_f)
+                    for d, t_f, g in zip(gw["date"].tolist(), gw["temp_f"].tolist(), gw["gwdd"].tolist()):
+                        rows.append({
+                            "date": d,
+                            "country": str(r["country"]),
+                            "city": str(r["city"]),
+                            "temp_f": float(t_f),
+                            "gwdd": float(g),
+                            "weight": float(r["weight"]),
+                            "weighted_gwdd": float(g) * float(r["weight"]),
+                        })
+                        weighted_daily[d] = weighted_daily.get(d, 0.0) + (float(g) * float(r["weight"]))
+                except Exception as e:
+                    pass  # global fetch failed (silenced to keep UI fast)
 
-            if not selected:
-                st.info("Select at least one region to show global weather + GWDD.")
+            if rows:
+                df_global = pd.DataFrame(rows).sort_values(["date", "country"]).reset_index(drop=True)
+                st.dataframe(
+                    df_global[["date", "country", "city", "temp_f", "gwdd"]],
+                    use_container_width=True,
+                    hide_index=True,
+                    height=320,
+                )
+
+                df_weighted = pd.DataFrame(
+                    [{"date": d, "global_weighted_gwdd": v} for d, v in sorted(weighted_daily.items())]
+                )
+                df_weighted["global_weighted_gwdd"] = pd.to_numeric(df_weighted["global_weighted_gwdd"], errors="coerce")
+                st.markdown("### Global Weighted GWDD (Daily)")
+                st.dataframe(df_weighted, use_container_width=True, hide_index=True, height=220)
+                st.line_chart(df_weighted.set_index("date")["global_weighted_gwdd"])
+
+                # --- Single Signal: Bullish / Bearish / Neutral ---
+                cur_avg = float(df_weighted["global_weighted_gwdd"].head(min(7, len(df_weighted))).mean())
+                prev_avg = st.session_state.get("_prev_global_gwdd_avg")
+                st.session_state["_prev_global_gwdd_avg"] = cur_avg
+
+                signal_g = "Neutral"
+                if prev_avg is not None:
+                    delta = cur_avg - float(prev_avg)
+                    if delta >= 1.0:
+                        signal_g = "Bullish"
+                    elif delta <= -1.0:
+                        signal_g = "Bearish"
+
+                st.markdown(f"### Global GWDD Signal: **{signal_g}**")
             else:
-                g_frames = []
-                with st.spinner("Fetching global weather + calculating GWDD..."):
-                    for _, rrow in regions_df.iterrows():
-                        name = str(rrow.get("region", "")).strip()
-                        if name not in selected:
-                            continue
-                        try:
-                            rdf = fetch_open_meteo_daily(float(rrow["lat"]), float(rrow["lon"]), days=days)
-                            rgw = compute_gwdd(rdf, base_f=base_f)
-                            rgw["region"] = name
-                            rgw["weight"] = float(rrow.get("weight", 1.0))
-                            g_frames.append(rgw)
-                        except Exception as e:
-                            st.warning(f"Region failed: {name} — {e}")
-
-                if g_frames:
-                    g_all = pd.concat(g_frames, ignore_index=True)
-                    g_pivot = g_all.pivot_table(index="date", columns="region", values="gwdd", aggfunc="mean").sort_index()
-
-                    # Weighted overall
-                    g_all["w_gwdd"] = g_all["gwdd"] * g_all["weight"]
-                    g_overall = (
-                        g_all.groupby("date", as_index=False)
-                        .agg(weighted_sum=("w_gwdd", "sum"), weight_sum=("weight", "sum"))
-                    )
-                    g_overall["GWDD_global_weighted"] = g_overall["weighted_sum"] / g_overall["weight_sum"]
-                    g_overall = g_overall[["date", "GWDD_global_weighted"]].sort_values("date")
-
-                    cga, cgb = st.columns([1, 1])
-                    with cga:
-                        st.markdown("#### Global weighted GWDD (daily)")
-                        st.dataframe(g_overall, use_container_width=True, hide_index=True)
-                        st.line_chart(g_overall.set_index("date")["GWDD_global_weighted"])
-                    with cgb:
-                        st.markdown("#### Region GWDD (daily)")
-                        st.dataframe(g_pivot, use_container_width=True)
-                        st.line_chart(g_pivot)
-
-                    # Quick temperature snapshot (next day)
-                    st.markdown("#### Next-day temperature snapshot (°F)")
-                    next_day = g_all["date"].min()
-                    snap = (
-                        g_all[g_all["date"] == next_day][["region", "temp_f", "gwdd", "weight"]]
-                        .sort_values("weight", ascending=False)
-                        .reset_index(drop=True)
-                    )
-                    st.dataframe(snap, use_container_width=True, hide_index=True)
-                else:
-                    st.error("No global region data fetched. Check internet or region coordinates.")
+                st.info("Global GWDD: No data returned (check internet).")
 
 # -----------------------------
-# Tab 2: EIA Storage
-# -----------------------------
-
-    # -----------------------------
-
-    # Day 1–14 Consensus Model GWDD (AUTO, ADD ONLY)
-    st.markdown("## Day 1–14 Consensus Model Gas-Weighted Degree Day (GWDD) Outlook")
-    st.caption("Auto-updated from Open-Meteo model feeds (GFS Operational, GEFS, ECMWF). Uses your existing city weights (gas demand weighting).")
-
-    auto_models = st.checkbox("Auto-update models (recommended)", value=True, help="Pulls model temperatures automatically and computes GWDD. If unchecked, you can upload CSVs.")
-    horizon_days = st.slider("Outlook days", min_value=7, max_value=14, value=14, step=1, help="Day 1–14 horizon")
-    st.markdown("### Performance weights (lower error = higher weight)")
-    colw1, colw2, colw3 = st.columns(3)
-    with colw1:
-        err_gfs_op = st.number_input("GFS Operational error score", value=1.00, step=0.05, help="Relative score (example: MAE). Smaller = better.")
-    with colw2:
-        err_gfs_ens = st.number_input("GEFS (GFS ENS) error score", value=1.10, step=0.05)
-    with colw3:
-        err_ec_ens = st.number_input("ECMWF ENS error score", value=0.95, step=0.05)
-
-    def _invw(x: float) -> float:
-        x = float(x) if x else 0.0
-        return 1.0 / x if x > 0 else 0.0
-
-    w1, w2, w3 = _invw(err_gfs_op), _invw(err_gfs_ens), _invw(err_ec_ens)
-    wsum = w1 + w2 + w3
-    if wsum <= 0:
-        w1, w2, w3 = 1/3, 1/3, 1/3
-        wsum = 1.0
-    w1, w2, w3 = w1/wsum, w2/wsum, w3/wsum
-    st.caption(f"Consensus weights → GFS Op: {w1:.2f} | GEFS: {w2:.2f} | ECMWF ENS: {w3:.2f}")
-
-    st.markdown("### (Optional) 5-year average GWDD line")
-    avg5_file = st.file_uploader("Upload 5-year average GWDD CSV (date, avg_gwdd)", type=["csv"], key="avg5_gwdd")
-    avg5 = None
-    if avg5_file:
-        avg5 = pd.read_csv(avg5_file)
-        # Normalize columns
-        cols = [c.lower().strip() for c in avg5.columns]
-        avg5.columns = cols
-        if "date" in avg5.columns:
-            avg5["date"] = pd.to_datetime(avg5["date"], errors="coerce")
-        if "avg_gwdd" not in avg5.columns:
-            # accept common names
-            for alt in ["gwdd", "avg", "value"]:
-                if alt in avg5.columns:
-                    avg5 = avg5.rename(columns={alt: "avg_gwdd"})
-                    break
-        avg5 = avg5.dropna(subset=["date", "avg_gwdd"]).sort_values("date")[["date", "avg_gwdd"]]
-
-    st.divider()
-
-    if auto_models:
-        with st.spinner("Auto-updating: fetching model temperatures and building GWDD outlook..."):
-            try:
-                gfs_op = build_model_weighted_gwdd(cities_df, base_f=base_f, days=horizon_days, model_key="gfs_op").rename(columns={"gwdd": "gfs_op_gwdd"})
-                gfs_ens = build_model_weighted_gwdd(cities_df, base_f=base_f, days=horizon_days, model_key="gfs_ens").rename(columns={"gwdd": "gfs_ens_gwdd"})
-                ec_ens = build_model_weighted_gwdd(cities_df, base_f=base_f, days=horizon_days, model_key="ecmwf_ens").rename(columns={"gwdd": "ecmwf_ens_gwdd"})
-
-                merged = gfs_op.merge(gfs_ens, on="date", how="outer").merge(ec_ens, on="date", how="outer").sort_values("date")
-            except Exception as e:
-                st.error(f"Auto model update failed: {e}")
-                merged = None
-    else:
-        st.info("Upload model GWDD CSVs (date, gwdd) to build the consensus.")
-        gfs_op_file = st.file_uploader("Upload GFS Operational GWDD CSV", type=["csv"], key="gfs_op_csv")
-        gfs_ens_file = st.file_uploader("Upload GFS ENS (GEFS) GWDD CSV", type=["csv"], key="gfs_ens_csv")
-        ecmwf_ens_file = st.file_uploader("Upload ECMWF ENS GWDD CSV", type=["csv"], key="ecmwf_ens_csv")
-
-        def _read_model_gwdd_csv(file_obj) -> pd.DataFrame:
-            df = pd.read_csv(file_obj)
-            # normalize columns
-            df.columns = [c.lower().strip() for c in df.columns]
-            if "date" not in df.columns:
-                raise ValueError("CSV missing 'date' column.")
-            df["date"] = pd.to_datetime(df["date"], errors="coerce")
-            # accept gwdd/value
-            if "gwdd" not in df.columns:
-                for alt in ["wgwdd", "value", "gwdd_overall_weighted", "gas_weighted_gwdd"]:
-                    if alt in df.columns:
-                        df = df.rename(columns={alt: "gwdd"})
-                        break
-            if "gwdd" not in df.columns:
-                raise ValueError("CSV missing 'gwdd' column (accepted: gwdd, wgwdd, value, gwdd_overall_weighted).")
-            df["gwdd"] = pd.to_numeric(df["gwdd"], errors="coerce")
-            return df.dropna(subset=["date", "gwdd"]).sort_values("date")[["date", "gwdd"]]
-
-        frames = []
-        if gfs_op_file:
-            frames.append(_read_model_gwdd_csv(gfs_op_file).rename(columns={"gwdd": "gfs_op_gwdd"}))
-        if gfs_ens_file:
-            frames.append(_read_model_gwdd_csv(gfs_ens_file).rename(columns={"gwdd": "gfs_ens_gwdd"}))
-        if ecmwf_ens_file:
-            frames.append(_read_model_gwdd_csv(ecmwf_ens_file).rename(columns={"gwdd": "ecmwf_ens_gwdd"}))
-
-        merged = None
-        if frames:
-            merged = frames[0]
-            for f in frames[1:]:
-                merged = merged.merge(f, on="date", how="outer")
-            merged = merged.sort_values("date")
-
-    if merged is not None and not merged.empty:
-        # Consensus
-        merged["consensus_gwdd"] = (
-            merged.get("gfs_op_gwdd") * w1 +
-            merged.get("gfs_ens_gwdd") * w2 +
-            merged.get("ecmwf_ens_gwdd") * w3
-        )
-
-        # Limit to horizon
-        merged = merged.sort_values("date").head(horizon_days)
-
-        st.markdown("### 1) Daily GWDDs (bars) + 5-year average (line)")
-        top = merged[["date", "consensus_gwdd"]].copy()
-        top["date_label"] = top["date"].dt.strftime("%b-%d")
-
-        # Display numbers similar to your screenshot
-        cols = st.columns(3)
-        cols[0].metric("Day 1 GWDD", f"{float(top['consensus_gwdd'].iloc[0]):.0f}")
-        cols[1].metric("Peak (1–14)", f"{float(top['consensus_gwdd'].max()):.0f}")
-        cols[2].metric("Avg (1–14)", f"{float(top['consensus_gwdd'].mean()):.0f}")
-
-        # Chart (bar = consensus)
-        chart_df = top.set_index("date")[["consensus_gwdd"]]
-        st.bar_chart(chart_df)
-
-        # Optional avg line + departures
-        if avg5 is not None and not avg5.empty:
-            # Align by date (merge)
-            a = avg5.copy()
-            a = a.rename(columns={"avg_gwdd": "avg5_gwdd"})
-            comp = merged.merge(a, on="date", how="left")
-            st.line_chart(comp.set_index("date")[["avg5_gwdd"]])
-
-            st.markdown("### 2) Departure From Normal (Consensus − 5Y Avg)")
-            comp["departure"] = comp["consensus_gwdd"] - comp["avg5_gwdd"]
-            dep = comp.dropna(subset=["departure"])[["date", "departure"]].set_index("date")
-            st.bar_chart(dep)
-        else:
-            st.info("Upload 5-year average GWDD CSV to show the red average line + departure-from-normal chart (exact like your example).")
-
-        st.markdown("### 3) 12-Hour Trend (proxy: change vs last run)")
-        # Store previous run in session_state to compute changes
-        prev = st.session_state.get("_prev_consensus_series")
-        cur = merged[["date", "consensus_gwdd"]].copy()
-        if prev is not None and isinstance(prev, pd.DataFrame) and not prev.empty:
-            tmp = cur.merge(prev, on="date", how="left", suffixes=("", "_prev"))
-            tmp["trend_change"] = tmp["consensus_gwdd"] - tmp["consensus_gwdd_prev"]
-            tr = tmp.dropna(subset=["trend_change"])[["date", "trend_change"]].set_index("date")
-            st.bar_chart(tr)
-        else:
-            st.info("Trend chart will appear after the next refresh (it compares against the previous run).")
-
-        st.session_state["_prev_consensus_series"] = cur
-
-        with st.expander("Show table (models + consensus)"):
-            show_cols = [c for c in ["date", "gfs_op_gwdd", "gfs_ens_gwdd", "ecmwf_ens_gwdd", "consensus_gwdd"] if c in merged.columns]
-            st.dataframe(merged[show_cols], use_container_width=True, hide_index=True)
-    else:
-        st.warning("No model data available yet. Turn on Auto-update OR upload model CSVs.")
-
-
 with tabs[1]:
     st.subheader("EIA Weekly Natural Gas Storage (BCF) + Weekly Injection/Withdrawal")
 
@@ -1068,11 +917,43 @@ with tabs[1]:
                 else:
                     ld = latest_pack.get("latest_period_date")
                     saved_fc = _get_saved_forecast(ld) if ld else None
+
+                    # --- AUTO SURPRISE fallback (added) ---
+                    # If there is no saved forecast for this report date, use the current market forecast input
+                    # and save it automatically so Surprise always updates.
                     if saved_fc is None:
-                        st.metric("Surprise (actual - forecast)", "N/A", help="Save forecast for that same report week to compute surprise correctly.")
+                        try:
+                            saved_fc = float(eia_market_forecast_bcf)
+                        except Exception:
+                            saved_fc = None
+                        if (ld is not None) and (saved_fc is not None):
+                            _set_saved_forecast(ld, saved_fc)
+
+                    if saved_fc is None:
+                        st.metric("Surprise (actual - forecast)", "N/A")
                     else:
                         surprise = float(actual_chg) - float(saved_fc)
+
+                        # --- Color-coded Surprise + Alert (added) ---
+                        # Interpretation: more negative surprise = bigger withdrawal / tighter than expected => bullish NG
+                        if surprise <= -5:
+                            s_label = "Bullish"
+                            s_color = "#16a34a"  # green
+                        elif surprise >= 5:
+                            s_label = "Bearish"
+                            s_color = "#dc2626"  # red
+                        else:
+                            s_label = "Neutral"
+                            s_color = "#6b7280"  # gray
+
                         st.metric("Surprise (actual - forecast)", f"{surprise:+.0f} Bcf")
+                        st.markdown(
+                            f"<div style='margin-top:-8px; font-weight:700; color:{s_color};'>Signal from Surprise: {s_label}</div>",
+                            unsafe_allow_html=True,
+                        )
+
+                        if abs(surprise) >= 20:
+                            st.warning(f"Big Surprise alert: {surprise:+.0f} Bcf ({s_label})")
 
             if st.button("Refresh EIA now", help="Clears cached EIA fetch and reloads latest numbers."):
                 # Clear both the 'latest pack' cache and the full series cache
@@ -1602,90 +1483,4 @@ If you trade **NG=F (Yahoo front month)** or CFDs, the rollover behavior can dif
 
     df_roll = pd.DataFrame(rows)
     st.dataframe(df_roll, use_container_width=True)
-
-# -----------------------------
-# Tab 5: NG Price Indexes & Curves (ADD ONLY)
-# -----------------------------
-with tabs[4]:
-    st.header("Natural Gas Price Indexes & Forward Curves")
-    st.caption("Bidweek, Spot, Weekly, Forward Curves, LNG, Mexico, Shale & Historical Data")
-    st.info("This tab is ADD-ONLY. No existing logic or calculations are modified.")
-
-    st.subheader("Bidweek Price Indexes")
-    st.caption("First-of-Month natural gas price indexes (150+ locations in North America)")
-    bidweek_file = st.file_uploader("Upload Bidweek CSV (optional)", type=["csv"], key="bidweek")
-    if bidweek_file:
-        df = pd.read_csv(bidweek_file)
-        st.dataframe(df, use_container_width=True)
-
-    st.subheader("Daily Price Indexes (Spot)")
-    st.caption("Daily spot natural gas price indexes (170+ locations in North America)")
-    daily_file = st.file_uploader("Upload Daily Spot CSV (optional)", type=["csv"], key="daily")
-    if daily_file:
-        df = pd.read_csv(daily_file)
-        st.dataframe(df, use_container_width=True)
-
-    st.subheader("Weekly Price Indexes")
-    st.caption("Weekly averages of spot natural gas price indexes")
-    weekly_file = st.file_uploader("Upload Weekly CSV (optional)", type=["csv"], key="weekly")
-    if weekly_file:
-        df = pd.read_csv(weekly_file)
-        st.dataframe(df, use_container_width=True)
-
-    st.subheader("Forward Curve Data")
-    st.caption("Monthly basis & fixed forward curves out 10 years (updated daily) at key natgas hubs")
-    curve_file = st.file_uploader("Upload Forward Curve CSV (optional)", type=["csv"], key="curve")
-    if curve_file:
-        df = pd.read_csv(curve_file)
-        st.dataframe(df, use_container_width=True)
-        # If user has a date/period column + a price column, they can rename to these
-        if "price" in df.columns:
-            try:
-                st.line_chart(df.set_index(df.columns[0])["price"])
-            except Exception:
-                pass
-
-    st.subheader("LNG Data Suite")
-    st.caption("Key data to support North American natural gas and LNG business decisions")
-    lng_file = st.file_uploader("Upload LNG CSV (optional)", type=["csv"], key="lng")
-    if lng_file:
-        df = pd.read_csv(lng_file)
-        st.dataframe(df, use_container_width=True)
-
-    st.subheader("Mexico Price & Flow Data")
-    st.caption("Mexico natural gas pricing and pipeline flow data")
-    mexico_file = st.file_uploader("Upload Mexico CSV (optional)", type=["csv"], key="mexico")
-    if mexico_file:
-        df = pd.read_csv(mexico_file)
-        st.dataframe(df, use_container_width=True)
-
-    st.subheader("Daily Preliminary Prices")
-    st.caption("Indicative daily natural gas price data based on actual trade data")
-    prelim_daily = st.file_uploader("Upload Daily Preliminary CSV (optional)", type=["csv"], key="prelim_daily")
-    if prelim_daily:
-        df = pd.read_csv(prelim_daily)
-        st.dataframe(df, use_container_width=True)
-
-    st.subheader("Bidweek Preliminary Prices")
-    st.caption("Indicative bidweek pricing (last three days of the month) based on actual trade data")
-    prelim_bidweek = st.file_uploader("Upload Bidweek Preliminary CSV (optional)", type=["csv"], key="prelim_bidweek")
-    if prelim_bidweek:
-        df = pd.read_csv(prelim_bidweek)
-        st.dataframe(df, use_container_width=True)
-
-    st.subheader("Shale Prices")
-    st.caption("Transparent pricing data for major shale and unconventional plays in North America")
-    shale_file = st.file_uploader("Upload Shale Prices CSV (optional)", type=["csv"], key="shale")
-    if shale_file:
-        df = pd.read_csv(shale_file)
-        st.dataframe(df, use_container_width=True)
-
-    st.subheader("Historical Data")
-    st.caption("Historical datasets (some series back to 1988)")
-    hist_file = st.file_uploader("Upload Historical CSV (optional)", type=["csv"], key="historical")
-    if hist_file:
-        df = pd.read_csv(hist_file)
-        st.dataframe(df, use_container_width=True)
-
-    st.success("Loaded. When you have an OPIS / Argus / S&P export, upload CSVs here. API integration can be added later (still safe).")
 
