@@ -6,5 +6,6 @@ openpyxl
 yfinance>=0.2.40
 matplotlib
 plotly
+feedparser
 
 
