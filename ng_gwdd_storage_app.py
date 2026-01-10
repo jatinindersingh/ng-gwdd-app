@@ -2165,11 +2165,11 @@ with tabs[4]:
         spread_pct = (spread / float(front_px)) * 100.0
 
         if spread > 0:
-            structure = "Contango (next > front) → rollover drag for longs (HNU), helps shorts (HND)"
+            structure = "Contango (next > front)"
         elif spread < 0:
-            structure = "Backwardation (next < front) → rollover benefit for longs (HNU), hurts shorts (HND)"
+            structure = "Backwardation (next < front)"
         else:
-            structure = "Flat (next ≈ front) → minimal rollover impact"
+            structure = "Flat (next ≈ front)"
 
     s1, s2, s3 = st.columns(3)
     with s1:
@@ -2186,6 +2186,35 @@ with tabs[4]:
         st.write(f"**Structure:** {structure}")
     st.caption("Note: This is a simple front-vs-next check using delayed Yahoo monthly futures (or manual input).")
 
+
+    # -----------------------------
+    # HNU rollover impact estimate (optional)
+    # -----------------------------
+    with st.expander("HNU rollover estimate (optional)", expanded=False):
+        st.caption("Estimate only (not broker-exact). Assumes HNU behaves ~2× daily % move of NG and rollover impact approximates -2×(next-front)/front.")
+        hnu_px = st.number_input("Current HNU price (CAD)", value=0.0, step=0.01, help="Enter current HNU market price to estimate rollover impact.")
+        leverage = st.number_input("HNU leverage vs NG (approx)", value=2.0, step=0.1, help="HNU is approximately 2× daily NG move (estimate).")
+
+        if front_px and next_px and float(front_px) != 0.0 and hnu_px and float(hnu_px) > 0.0:
+            roll_pct = (float(next_px) - float(front_px)) / float(front_px)  # + = contango (headwind), - = backwardation (tailwind)
+            hnu_roll_pct = -float(leverage) * roll_pct
+            est_hnu = float(hnu_px) * (1.0 + hnu_roll_pct)
+
+            if hnu_roll_pct > 0:
+                label = "tailwind (backwardation)"
+            elif hnu_roll_pct < 0:
+                label = "headwind (contango)"
+            else:
+                label = "flat"
+
+            cA, cB = st.columns(2)
+            with cA:
+                st.metric("Estimated rollover impact", f"{hnu_roll_pct*100:+.1f}%")
+                st.caption(label)
+            with cB:
+                st.metric("Estimated HNU after rollover (NG flat)", f"{est_hnu:.2f}")
+        else:
+            st.info("Enter current HNU price above (and ensure front/next prices are available) to see the rollover estimate.")
 
     st.markdown(
         f"""
