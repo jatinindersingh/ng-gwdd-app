@@ -208,6 +208,44 @@ def fetch_open_meteo_daily_model(lat: float, lon: float, days: int = 14, model: 
         return pd.DataFrame(columns=["date", "temp_c", "temp_f"])
 
 
+
+@st.cache_data(ttl=60 * 30, show_spinner=False)  # 30 minutes
+def fetch_open_meteo_daily_history(lat: float, lon: float, past_days: int = 7, forecast_days: int = 10) -> pd.DataFrame:
+    """
+    Fetch daily mean temperatures from Open-Meteo including recent ACTUALS (past_days) and FORECAST (forecast_days).
+    Returns columns: date, temp_c, temp_f, kind ('Actual'/'Forecast')
+    """
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "daily": "temperature_2m_mean",
+        "past_days": int(past_days),
+        "forecast_days": int(forecast_days),
+        "timezone": "UTC",
+    }
+
+    try:
+        r = requests.get(url, params=params, timeout=8)
+        r.raise_for_status()
+        js = r.json()
+
+        daily = js.get("daily", {})
+        times = daily.get("time", [])
+        temps_c = daily.get("temperature_2m_mean", [])
+        if not times or not temps_c or len(times) != len(temps_c):
+            return pd.DataFrame(columns=["date", "temp_c", "temp_f", "kind"])
+
+        df = pd.DataFrame({"date": pd.to_datetime(times), "temp_c": temps_c})
+        df["temp_f"] = df["temp_c"].map(c_to_f)
+
+        # Split Actual vs Forecast using today's UTC date (Open-Meteo returns UTC daily)
+        today_utc = pd.Timestamp.utcnow().normalize()
+        df["kind"] = np.where(df["date"] < today_utc, "Actual", "Forecast")
+        return df[["date", "temp_c", "temp_f", "kind"]]
+    except Exception:
+        return pd.DataFrame(columns=["date", "temp_c", "temp_f", "kind"])
+
 def _try_models_for_city(lat: float, lon: float, days: int, model_candidates: list[str], label: str) -> pd.DataFrame:
     """
     Try a list of Open-Meteo model codes and return the first that works.
@@ -607,7 +645,8 @@ st.title("NG USA — GWDD (All Cities) + EIA Storage (Injection/Withdrawal)")
 
 with st.sidebar:
     st.header("GWDD Settings")
-    base_f = st.number_input("Base Temp (°F)", min_value=30.0, max_value=80.0, value=65.0, step=0.5)
+    base_c = st.number_input("Base Temp (°C)", min_value=-5.0, max_value=30.0, value=18.0, step=0.5)
+    base_f = c_to_f(base_c)  # internal (GWDD uses Fahrenheit for GWDD math)
     days = st.slider("Forecast Days", min_value=3, max_value=16, value=10, step=1)
 
     st.subheader("Cities (edit list)")
@@ -623,15 +662,32 @@ with st.sidebar:
         },
         key="cities_editor",
     )
+    # Ensure required columns exist even if user edits/removes them in the UI
+    # (Prevents US GWHDD / GWDD calculations from silently returning empty.)
+    if 'lon' not in cities_df.columns or 'lat' not in cities_df.columns:
+        cities_df = cities_df.merge(DEFAULT_CITIES[['city','lat','lon']], on='city', how='left', suffixes=('', '_default'))
+        if 'lat_default' in cities_df.columns:
+            cities_df['lat'] = cities_df['lat'].fillna(cities_df['lat_default'])
+            cities_df = cities_df.drop(columns=['lat_default'])
+        if 'lon_default' in cities_df.columns:
+            cities_df['lon'] = cities_df['lon'].fillna(cities_df['lon_default'])
+            cities_df = cities_df.drop(columns=['lon_default'])
+    if 'weight' not in cities_df.columns:
+        cities_df['weight'] = 1.0
+    cities_df['weight'] = pd.to_numeric(cities_df['weight'], errors='coerce').fillna(1.0)
+
 
     st.divider()
     st.header("EIA Storage Settings")
     api_key = st.text_input(
         "EIA API Key",
-        value=os.getenv("EIA_API_KEY", ""),
+        value=st.secrets.get("EIA_API_KEY", os.getenv("EIA_API_KEY", "")),
         type="password",
         help="Get a key from EIA. Tip: you can set an environment variable EIA_API_KEY.",
     )
+
+    # Keep key in session_state so other tabs (Drivers) can read it reliably
+    st.session_state["EIA_API_KEY"] = str(api_key).strip() if api_key is not None else ""
 
     # Market expectation for the *next* EIA storage report (manual entry).
     # Negative = expected withdrawal, Positive = expected injection.
@@ -768,12 +824,422 @@ def front_delivery_month(today: "dt.date") -> tuple[int,int]:
         return y+1, 1
     return y, m+1
 
-tabs = st.tabs(["GWDD Dashboard", "EIA Storage Dashboard", "Signals & Summary", "Contracts & Rollover", "NG News"])
+
+# ==============================
+# Extra Drivers Modules (Tab 1)
+# LNG exports (terminal), Freeze-off risk, Backwardation, Power burn
+# ==============================
+
+@st.cache_data(ttl=60*30, show_spinner=False)
+def _fetch_eia_dnav_table(url: str):
+    """Fetches EIA dnav HTML table and returns a tidy monthly time series.
+    Returns DataFrame with columns: period (Timestamp), value (float in MMCF)
+    """
+    import pandas as _pd
+    import requests as _requests
+
+    r = _requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    tables = _pd.read_html(r.text)
+    if not tables:
+        return _pd.DataFrame(columns=["period", "value"])
+    df = tables[0].copy()
+    # Expected: first column Year, then Jan..Dec
+    if df.shape[1] < 2:
+        return _pd.DataFrame(columns=["period", "value"])
+    df.columns = [str(c).strip() for c in df.columns]
+    year_col = df.columns[0]
+    month_cols = df.columns[1:]
+    out_rows = []
+    for _, row in df.iterrows():
+        year = row.get(year_col)
+        try:
+            year_int = int(str(year).strip())
+        except Exception:
+            continue
+        for mname in month_cols:
+            val = row.get(mname)
+            if val in (None, "-", "--", "NA", "W"):
+                continue
+            try:
+                val_f = float(str(val).replace(",", "").strip())
+            except Exception:
+                continue
+            # Parse month name (Jan, Feb, ...)
+            try:
+                month_int = dt.datetime.strptime(mname[:3], "%b").month
+            except Exception:
+                continue
+            out_rows.append({"period": _pd.Timestamp(year_int, month_int, 1), "value": val_f})
+    out = _pd.DataFrame(out_rows).sort_values("period")
+    return out
+
+def _mmcfm_to_bcfd(month_start: "pd.Timestamp", mmcf: float) -> float:
+    import pandas as _pd
+    # mmcf per month -> bcf/d
+    days = (_pd.Timestamp(month_start) + _pd.offsets.MonthEnd(1)).day
+    return (mmcf / 1000.0) / float(days)
+
+@st.cache_data(ttl=60*10, show_spinner=False)
+def _open_meteo_daily_minmax(lat: float, lon: float, days: int = 7):
+    import requests as _requests
+    import pandas as _pd
+    url = (
+        "https://api.open-meteo.com/v1/forecast"
+        f"?latitude={lat}&longitude={lon}"
+        "&daily=temperature_2m_min,temperature_2m_max"
+        f"&forecast_days={days}"
+        "&timezone=auto"
+    )
+    r = _requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    js = r.json()
+    daily = js.get("daily", {}) if isinstance(js, dict) else {}
+    dates = daily.get("time", [])
+    tmin = daily.get("temperature_2m_min", [])
+    tmax = daily.get("temperature_2m_max", [])
+    df = _pd.DataFrame({"date": dates, "tmin_c": tmin, "tmax_c": tmax})
+    if not df.empty:
+        df["date"] = _pd.to_datetime(df["date"])
+    return df
+
+def _safe_yf_last(ticker: str):
+    try:
+        import yfinance as _yf
+        import pandas as _pd
+        hist = _yf.download(ticker, period="7d", interval="1h", progress=False)
+        if hist is None or hist.empty:
+            hist = _yf.download(ticker, period="30d", interval="1d", progress=False)
+        if hist is None or hist.empty:
+            return None
+        last = hist["Close"].dropna().iloc[-1]
+        return float(last)
+    except Exception:
+        return None
+
+def _guess_next_ng_ticker() -> str:
+    """Best-effort guess for next-month NYMEX NG ticker on Yahoo Finance.
+    Yahoo commonly uses 'NG{MonthCode}{YY}.NYM' (not guaranteed)."""
+    month_codes = {1:"F",2:"G",3:"H",4:"J",5:"K",6:"M",7:"N",8:"Q",9:"U",10:"V",11:"X",12:"Z"}
+    now = dt.datetime.utcnow()
+    m = now.month + 1
+    y = now.year
+    if m == 13:
+        m = 1
+        y += 1
+    code = month_codes.get(m, "F")
+    yy = str(y)[-2:]
+    return f"NG{code}{yy}.NYM"
+
+def _render_lng_tracker():
+    st.subheader("LNG exports / feedgas proxy (fast signal)")
+    st.caption("EIA terminal-level live feedgas is limited. This module uses a resilient proxy: tries terminal tables first, then falls back to EIA series trend so you always get a signal.")
+
+    api_key = str(st.session_state.get("EIA_API_KEY", "") or "").strip()
+    if not api_key:
+        st.info("Enter your EIA API key in the sidebar to enable LNG export proxy signals.")
+        return
+
+    terminals = {
+        "Freeport": "https://www.eia.gov/dnav/ng/ng_move_exp_lng_a_EPG0_TXM_mmcf_a.htm",
+        "Sabine Pass": "https://www.eia.gov/dnav/ng/ng_move_exp_lng_a_EPG0_LA2_mmcf_a.htm",
+        "Corpus Christi": "https://www.eia.gov/dnav/ng/ng_move_exp_lng_a_EPG0_TX2_mmcf_a.htm",
+    }
+
+    rows = []
+    any_ok = False
+    for name, url in terminals.items():
+        try:
+            ts = _fetch_eia_dnav_table(url)
+            if ts is None or ts.empty:
+                rows.append({"Terminal": name, "Latest month": "N/A", "MMCF": None, "Approx Bcf/d": None})
+                continue
+            any_ok = True
+            last = ts.dropna().iloc[-1]
+            period = str(last["date"])[:7] if "date" in last else "Latest"
+            val = float(last["value"])
+            bcfd = val / 1000.0 / 30.0  # rough conversion for display
+            rows.append({"Terminal": name, "Latest month": period, "MMCF": round(val, 0), "Approx Bcf/d": round(bcfd, 2)})
+        except Exception:
+            rows.append({"Terminal": name, "Latest month": "N/A", "MMCF": None, "Approx Bcf/d": None})
+
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    # Fallback series (trend-based) so signal isn't stuck at N/A
+    # Default series IDs are best-effort; user can override if needed.
+    with st.expander("Advanced: series IDs (optional)", expanded=False):
+        lng_series = st.text_input("EIA series id (LNG exports / feedgas proxy)", value="NG.N9133US2.M")
+        pipe_series = st.text_input("EIA series id (Pipeline exports proxy)", value="NG.N9132US2.M")
+
+    def _trend_label(vals: list[float]) -> tuple[str, float]:
+        if len(vals) < 6:
+            return "Neutral", 0.0
+        a = float(np.mean(vals[-3:]))
+        b = float(np.mean(vals[-6:-3]))
+        if b == 0:
+            return "Neutral", 0.0
+        pct = (a - b) / abs(b)
+        if pct >= 0.02:
+            return "Bullish", pct
+        if pct <= -0.02:
+            return "Bearish", pct
+        return "Neutral", pct
+
+    try:
+        lng_vals = []
+        pipe_vals = []
+        try:
+            df_lng = fetch_eia_series(str(lng_series).strip(), api_key=api_key)
+            lng_vals = df_lng["value"].dropna().astype(float).tolist()
+        except Exception:
+            lng_vals = []
+
+        try:
+            df_pipe = fetch_eia_series(str(pipe_series).strip(), api_key=api_key)
+            pipe_vals = df_pipe["value"].dropna().astype(float).tolist()
+        except Exception:
+            pipe_vals = []
+
+        sig_lng, pct_lng = _trend_label(lng_vals) if lng_vals else ("Neutral", 0.0)
+        sig_pipe, pct_pipe = _trend_label(pipe_vals) if pipe_vals else ("Neutral", 0.0)
+
+        score = 0
+        score += 1 if sig_lng == "Bullish" else (-1 if sig_lng == "Bearish" else 0)
+        score += 1 if sig_pipe == "Bullish" else (-1 if sig_pipe == "Bearish" else 0)
+
+        if score >= 1:
+            st.success(f"LNG / exports signal: Bullish (LNG trend {pct_lng*100:+.1f}%, pipeline trend {pct_pipe*100:+.1f}%)")
+        elif score <= -1:
+            st.error(f"LNG / exports signal: Bearish (LNG trend {pct_lng*100:+.1f}%, pipeline trend {pct_pipe*100:+.1f}%)")
+        else:
+            st.info(f"LNG / exports signal: Neutral (LNG trend {pct_lng*100:+.1f}%, pipeline trend {pct_pipe*100:+.1f}%)")
+    except Exception:
+        st.info("LNG / exports signal: Neutral (data fetch issue).")
+
+def _render_freezeoff_alert():
+    st.subheader("Production freeze‑off risk (weather + supply)")
+    st.caption("Weather-based freeze risk (proxy). Higher risk can reduce production and is usually bullish for NG. Confirmed risk zones are highlighted below.")
+
+    # Key producing areas (approx)
+    points = [
+        ("Permian (Midland, TX)", 31.9973, -102.0779),
+        ("Oklahoma (OKC, OK)", 35.4676, -97.5164),
+        ("Haynesville (Shreveport, LA)", 32.5252, -93.7502),
+        ("Appalachia (Pittsburgh, PA)", 40.4406, -79.9959),
+    ]
+
+    import pandas as _pd
+    risk_rows = []
+    worst_score = 0
+    for name, lat, lon in points:
+        try:
+            df = _open_meteo_daily_minmax(lat, lon, days=7)
+            if df.empty:
+                risk_rows.append({"Region": name, "Coldest next 7d (°C)": None, "Risk": "N/A"})
+                continue
+            coldest = float(df["tmin_c"].min())
+            if coldest <= -10:
+                risk = "High"
+                score = 1
+            elif coldest <= -5:
+                risk = "Medium"
+                score = 0.5
+            else:
+                risk = "Low"
+                score = 0
+            worst_score = max(worst_score, score)
+            risk_rows.append({"Region": name, "Coldest next 7d (°C)": round(coldest, 1), "Risk": risk})
+        except Exception:
+            risk_rows.append({"Region": name, "Coldest next 7d (°C)": None, "Risk": "N/A"})
+
+    st.dataframe(_pd.DataFrame(risk_rows), use_container_width=True, hide_index=True)
+
+    if worst_score >= 1:
+        st.success("Freeze‑off alert: Bullish (High risk in at least one key region)")
+    elif worst_score >= 0.5:
+        st.info("Freeze‑off alert: Neutral‑to‑Bullish (Medium risk in at least one key region)")
+    else:
+        st.error("Freeze‑off alert: Bearish/Neutral (Low freeze risk)")
+
+def _render_backwardation_detector():
+    st.subheader("Backwardation detector (front vs next contract)")
+    st.caption("Backwardation = near contract price > next contract price (often supportive). Contango is the opposite.")
+
+    # Auto-pick explicit contracts to avoid Yahoo mapping both to the same continuous price.
+    try:
+        y1, m1 = front_delivery_month(dt.date.today())
+        if m1 == 12:
+            y2, m2 = y1 + 1, 1
+        else:
+            y2, m2 = y1, m1 + 1
+        auto_front = f"{ng_symbol(y1, m1)}.NYM"
+        auto_next = f"{ng_symbol(y2, m2)}.NYM"
+    except Exception:
+        auto_front, auto_next = "NG=F", _guess_next_ng_ticker()
+
+    colA, colB = st.columns(2)
+    with colA:
+        front = st.text_input("Front-month ticker (Yahoo Finance)", value=auto_front)
+    with colB:
+        nxt = st.text_input("Next-month ticker (Yahoo Finance)", value=auto_next)
+
+    p_front = _safe_yf_last(front.strip()) if front.strip() else None
+    p_next = _safe_yf_last(nxt.strip()) if nxt.strip() else None
+
+    if p_front is None or p_next is None:
+        st.warning("Could not fetch one of the tickers from Yahoo Finance. If you see N/A, try a different ticker format.")
+        st.write(f"Front: **{front}** → {p_front if p_front is not None else 'N/A'}")
+        st.write(f"Next: **{nxt}** → {p_next if p_next is not None else 'N/A'}")
+        st.info("Tip: Try explicit contracts like NGF26.NYM / NGG26.NYM (front/next).")
+        return
+
+    spread = float(p_front) - float(p_next)
+    st.write(f"Front: **{front}** = {p_front:.3f}")
+    st.write(f"Next: **{nxt}** = {p_next:.3f}")
+    st.write(f"Spread (Front - Next): **{spread:+.4f}**")
+
+    # If Yahoo returns the same price for both, it can mean one ticker isn't resolving correctly.
+    if abs(spread) < 1e-6:
+        st.info("Curve signal: Neutral (Flat)")
+        st.caption("Note: If spread is always 0.0000, Yahoo may be mapping one ticker incorrectly. Try explicit contracts (e.g., NGF26.NYM vs NGG26.NYM).")
+        return
+
+    # Small threshold to avoid noise / rounding
+    thr = 0.03
+    if spread >= thr:
+        st.success("Curve signal: Bullish (Backwardation)")
+    elif spread <= -thr:
+        st.error("Curve signal: Bearish (Contango)")
+    else:
+        st.info("Curve signal: Neutral (Flat-ish)")
+def _eia_v2_get(url: str, params: dict):
+    import requests as _requests
+    r = _requests.get(url, params=params, timeout=25, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    return r.json()
+
+def _render_power_burn_score(eia_key: str | None):
+    st.subheader("Power burn real-time signal (gas generation)")
+    st.caption("Uses EIA API v2 electricity RTO fuel-type data (hourly). If it fails, adjust facets below.")
+
+    if not eia_key:
+        st.warning("EIA API key not found. Add your key in sidebar (EIA Storage Settings).")
+        return
+
+    # User-tunable facets (because EIA facets can differ by dataset version)
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        respondent = st.text_input("respondent facet", value="US48")
+    with col2:
+        fueltype = st.text_input("fueltype facet", value="NG")
+    with col3:
+        freq = st.selectbox("frequency", ["hourly", "local-hourly"], index=0)
+
+    end = dt.datetime.utcnow()
+    start = end - dt.timedelta(days=8)
+
+    base_url = "https://api.eia.gov/v2/electricity/rto/fuel-type-data/data/"
+    params = {
+        "api_key": eia_key,
+        "frequency": freq,
+        "data[0]": "value",
+        "start": start.strftime("%Y-%m-%dT%H"),
+        "end": end.strftime("%Y-%m-%dT%H"),
+        "sort[0][column]": "period",
+        "sort[0][direction]": "desc",
+        "length": 5000,
+    }
+    # Add facets if provided
+    if respondent.strip():
+        params["facets[respondent][]"] = respondent.strip()
+    if fueltype.strip():
+        params["facets[fueltype][]"] = fueltype.strip()
+
+    try:
+        js = _eia_v2_get(base_url, params)
+        data = js.get("response", {}).get("data", [])
+        import pandas as _pd
+        df = _pd.DataFrame(data)
+        if df.empty or "value" not in df.columns or "period" not in df.columns:
+            st.warning("No data returned (check facets).")
+            return
+        df["period"] = _pd.to_datetime(df["period"], errors="coerce")
+        df["value"] = _pd.to_numeric(df["value"], errors="coerce")
+        df = df.dropna(subset=["period", "value"])
+        if df.empty:
+            st.warning("No usable data after parsing.")
+            return
+
+        # Sum across BAs for each timestamp if multiple rows
+        series = df.groupby("period")["value"].sum().sort_index()
+        last_24h = series[series.index >= (series.index.max() - _pd.Timedelta(hours=24))].mean()
+        prev_7d = series[series.index < (series.index.max() - _pd.Timedelta(hours=24))]
+        avg_7d = prev_7d.mean() if not prev_7d.empty else None
+
+        
+        st.write(f"Last 24h avg gas generation: **{last_24h:,.0f}** (units as provided by EIA)")
+
+        # Compare vs short baseline (7d) AND medium baseline (~28d) to reduce false signals.
+        delta7 = None
+        delta28 = None
+        if avg_7d is not None and avg_7d > 0:
+            delta7 = (last_24h - avg_7d) / avg_7d
+            st.write(f"Vs prior 7d avg: **{delta7*100:+.1f}%**")
+
+        avg_28d = None
+        try:
+            if len(vals) >= 24 * 28:
+                avg_28d = float(pd.Series(vals).tail(24 * 28).mean())
+            elif len(vals) >= 24 * 14:
+                avg_28d = float(pd.Series(vals).tail(24 * 14).mean())
+        except Exception:
+            avg_28d = None
+
+        if avg_28d is not None and avg_28d > 0:
+            delta28 = (last_24h - avg_28d) / avg_28d
+            st.write(f"Vs prior ~28d avg: **{delta28*100:+.1f}%**")
+
+        # Optional: confirm with GWDD trend if available from the app
+        gwdd_hint = None
+        try:
+            od = st.session_state.get("overall_disp")
+            if isinstance(od, pd.DataFrame) and (not od.empty) and ("Signal" in od.columns):
+                gwdd_hint = str(od.iloc[-1]["Signal"])
+        except Exception:
+            gwdd_hint = None
+
+        # Decision
+        thr = 0.02  # 2% threshold
+        if delta7 is None and delta28 is None:
+            st.info("Power burn signal: Neutral (not enough history).")
+        else:
+            d7_ok = (delta7 is not None)
+            d28_ok = (delta28 is not None)
+
+            bullish = ((not d7_ok or delta7 >= thr) and (not d28_ok or delta28 >= thr))
+            bearish = ((not d7_ok or delta7 <= -thr) and (not d28_ok or delta28 <= -thr))
+
+            if bullish:
+                if gwdd_hint == "BEARISH":
+                    st.info("Power burn signal: Neutral (power burn up, but GWDD trend bearish)")
+                else:
+                    st.success("Power burn signal: Bullish (above baseline gas generation)")
+            elif bearish:
+                if gwdd_hint == "BULLISH":
+                    st.info("Power burn signal: Neutral (power burn down, but GWDD trend bullish)")
+                else:
+                    st.error("Power burn signal: Bearish (below baseline gas generation)")
+            else:
+                st.info("Power burn signal: Neutral (mixed / near baseline)")
+    except Exception as e:
+        st.warning(f"Power burn fetch failed: {e}")
+
+tabs = st.tabs(["NG Drivers + Auto Signal", "GWDD Dashboard", "EIA Storage Dashboard", "Signals & Summary", "Contracts & Rollover", "NG News"])
 
 # -----------------------------
 # Tab 1: GWDD
 # -----------------------------
-with tabs[0]:
+with tabs[1]:
     st.subheader("GWDD (City-wise + Overall Weighted)")
 
     if cities_df.empty:
@@ -819,12 +1285,62 @@ with tabs[0]:
             c1, c2, c3 = st.columns(3)
             c1.metric("Cities", int(all_city["city"].nunique()))
             c2.metric("Forecast Days", int(days))
-            c3.metric("Base (°F)", f"{base_f:g}")
+            c3.metric("Base (°C)", f"{base_c:g}")
 
             st.markdown("### Overall Weighted GWDD (Daily)")
-            st.dataframe(overall, use_container_width=True, hide_index=True)
-            st.line_chart(overall.set_index("date")["GWDD_overall_weighted"])
 
+            # Add 3-day & 7-day averages + bullish/neutral/bearish signal
+            overall_disp = overall.copy()
+            overall_disp["date"] = pd.to_datetime(overall_disp["date"])
+            overall_disp = overall_disp.sort_values("date")
+            overall_disp["GWDD_overall_weighted"] = pd.to_numeric(overall_disp["GWDD_overall_weighted"], errors="coerce")
+
+            overall_disp["GWDD_avg_3d"] = overall_disp["GWDD_overall_weighted"].rolling(window=3, min_periods=1).mean()
+            overall_disp["GWDD_avg_7d"] = overall_disp["GWDD_overall_weighted"].rolling(window=7, min_periods=1).mean()
+            overall_disp["Trend_3d_minus_7d"] = overall_disp["GWDD_avg_3d"] - overall_disp["GWDD_avg_7d"]
+
+            def _gwdd_signal(x: float) -> str:
+                if pd.isna(x):
+                    return "N/A"
+                if x >= 0.5:
+                    return "BULLISH"
+                if x <= -0.5:
+                    return "BEARISH"
+                return "NEUTRAL"
+
+            overall_disp["Signal"] = overall_disp["Trend_3d_minus_7d"].apply(_gwdd_signal)
+
+            # Save for NG Drivers tab
+            st.session_state["overall_disp"] = overall_disp.copy()
+
+            # Show latest signal box
+            if len(overall_disp) > 0:
+                latest = overall_disp.iloc[-1]
+                sig = str(latest["Signal"])
+                trend = float(latest["Trend_3d_minus_7d"]) if pd.notna(latest["Trend_3d_minus_7d"]) else 0.0
+                a3 = float(latest["GWDD_avg_3d"]) if pd.notna(latest["GWDD_avg_3d"]) else 0.0
+                a7 = float(latest["GWDD_avg_7d"]) if pd.notna(latest["GWDD_avg_7d"]) else 0.0
+                if sig == "BULLISH":
+                    st.success(f"GWDD Signal: **BULLISH** (3d–7d = {trend:+.2f})")
+                elif sig == "BEARISH":
+                    st.error(f"GWDD Signal: **BEARISH** (3d–7d = {trend:+.2f})")
+                elif sig == "NEUTRAL":
+                    st.warning(f"GWDD Signal: **NEUTRAL** (3d–7d = {trend:+.2f})")
+                c1, c2 = st.columns(2)
+                c1.metric("GWDD 3-day avg", f"{a3:.2f}")
+                c2.metric("GWDD 7-day avg", f"{a7:.2f}")
+
+            st.dataframe(
+                overall_disp[["date","GWDD_overall_weighted","GWDD_avg_3d","GWDD_avg_7d","Signal"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.line_chart(overall_disp.set_index("date")["GWDD_overall_weighted"])
+
+            # -----------------------------
+            # -----------------------------
+            # US Gas-Weighted HDD (GWHDD) — Forecast + Trend (forecast-only, stable)
+            # -----------------------------
             st.divider()
             st.subheader("Global NG Countries — Daily GWDD (Country + Date)")
 
@@ -841,7 +1357,7 @@ with tabs[0]:
                             "date": d,
                             "country": str(r["country"]),
                             "city": str(r["city"]),
-                            "temp_f": float(t_f),
+                            "temp_c": f_to_c(float(t_f)),
                             "gwdd": float(g),
                             "weight": float(r["weight"]),
                             "weighted_gwdd": float(g) * float(r["weight"]),
@@ -853,7 +1369,7 @@ with tabs[0]:
             if rows:
                 df_global = pd.DataFrame(rows).sort_values(["date", "country"]).reset_index(drop=True)
                 st.dataframe(
-                    df_global[["date", "country", "city", "temp_f", "gwdd"]],
+                    df_global[["date", "country", "city", "temp_c", "gwdd"]],
                     use_container_width=True,
                     hide_index=True,
                     height=320,
@@ -885,7 +1401,7 @@ with tabs[0]:
                 st.info("Global GWDD: No data returned (check internet).")
 
 # -----------------------------
-with tabs[1]:
+with tabs[2]:
     st.subheader("EIA Weekly Natural Gas Storage (BCF) + Weekly Injection/Withdrawal")
 
     st.markdown("### EIA storage report (forecast + actual)")
@@ -1050,9 +1566,156 @@ with tabs[1]:
         st.dataframe(stor.tail(104), use_container_width=True, hide_index=True)  # last ~2 years
         st.line_chart(stor.set_index("date")["value"])
 
-        st.markdown("### Weekly Injection/Withdrawal (BCF)")
-        ch = stor.dropna(subset=["weekly_change"]).set_index("date")["weekly_change"]
-        st.line_chart(ch)
+        # (Hidden) Weekly Injection/Withdrawal (BCF) chart removed for cleaner UI
+
+        # --- Add 5-year average + signal + next-7-day outlook (added) ---
+        try:
+            ch_df = stor.dropna(subset=["weekly_change"]).copy()
+            ch_df["date"] = pd.to_datetime(ch_df["date"])
+            ch_df = ch_df.sort_values("date")
+            ch_df["weekly_change"] = pd.to_numeric(ch_df["weekly_change"], errors="coerce")
+            ch_df = ch_df.dropna(subset=["weekly_change"])
+
+            # 5-year average by ISO week number (uses last ~5 years of history)
+            today = dt.date.today()
+            start_5y = pd.Timestamp(today) - pd.Timedelta(days=365*5 + 31)
+            hist5 = ch_df[ch_df["date"] >= start_5y].copy()
+            # Exclude current year from the average to avoid leakage
+            hist5 = hist5[hist5["date"].dt.year < today.year]
+            if hist5.empty:
+                hist5 = ch_df[ch_df["date"] >= start_5y].copy()
+
+            hist5["iso_week"] = hist5["date"].dt.isocalendar().week.astype(int)
+            avg5_by_week = hist5.groupby("iso_week")["weekly_change"].mean()
+
+            ch_df["iso_week"] = ch_df["date"].dt.isocalendar().week.astype(int)
+            ch_df["avg_5y_week"] = ch_df["iso_week"].map(avg5_by_week)
+
+            # Show combined series: actual vs 5y-average
+            comp = ch_df.set_index("date")[["weekly_change", "avg_5y_week"]].rename(
+                columns={"weekly_change": "actual_weekly_change", "avg_5y_week": "avg_5y_weekly_change"}
+            )
+            st.markdown("### Weekly Injection/Withdrawal vs 5-Year Average (BCF) - Clear View")
+            import altair as alt
+
+            actual_df = comp.reset_index()[["date", "actual_weekly_change"]].rename(
+                columns={"date": "Date", "actual_weekly_change": "BCF"}
+            )
+            avg_df = comp.reset_index()[["date", "avg_5y_weekly_change"]].rename(
+                columns={"date": "Date", "avg_5y_weekly_change": "BCF"}
+            )
+
+            chart_actual = alt.Chart(actual_df).mark_line(color="#1f77b4").encode(
+                x=alt.X("Date:T", title="Date"),
+                y=alt.Y("BCF:Q", title="Actual weekly change (BCF)")
+            ).properties(height=220)
+
+            chart_avg = alt.Chart(avg_df).mark_line(color="#d62728").encode(
+                x=alt.X("Date:T", title="Date"),
+                y=alt.Y("BCF:Q", title="5-year average (BCF)")
+            ).properties(height=220)
+
+            st.altair_chart(
+                alt.vconcat(chart_actual, chart_avg).resolve_scale(y="independent"),
+                use_container_width=True,
+            )
+
+            # Latest comparison + signal
+            latest_row = ch_df.iloc[-1]
+            actual = float(latest_row["weekly_change"])
+            avg5 = float(latest_row["avg_5y_week"]) if pd.notna(latest_row["avg_5y_week"]) else None
+
+            # 3-week vs 7-week rolling averages (storage change trend)
+            ch_df["avg_3w"] = ch_df["weekly_change"].rolling(window=3, min_periods=1).mean()
+            ch_df["avg_7w"] = ch_df["weekly_change"].rolling(window=7, min_periods=1).mean()
+            avg3w = float(ch_df["avg_3w"].iloc[-1])
+            avg7w = float(ch_df["avg_7w"].iloc[-1])
+            trend_w = avg3w - avg7w
+
+            # Signal rules (simple + robust):
+            # More negative (bigger withdrawals) => bullish. More positive (bigger injections) => bearish.
+            score = 0
+            if avg5 is not None:
+                diff_vs_5y = actual - avg5  # + means looser than normal, - means tighter than normal
+                if diff_vs_5y <= -10:  # tighter than normal by 10+ Bcf
+                    score += 1
+                elif diff_vs_5y >= 10:  # looser than normal by 10+ Bcf
+                    score -= 1
+            else:
+                diff_vs_5y = None
+
+            if trend_w <= -5:
+                score += 1
+            elif trend_w >= 5:
+                score -= 1
+
+            # Surprise (actual - saved forecast) if available from earlier table
+            # Negative surprise => more withdrawal / tighter => bullish
+            try:
+                if "surprise" in locals() and saved_fc is not None:
+                    if float(surprise) <= -5:
+                        score += 1
+                    elif float(surprise) >= 5:
+                        score -= 1
+            except Exception:
+                pass
+
+            if score >= 2:
+                sig = "BULLISH"
+                st.success("NG Storage Signal: **BULLISH**")
+            elif score <= -2:
+                sig = "BEARISH"
+                st.error("NG Storage Signal: **BEARISH**")
+            else:
+                sig = "NEUTRAL"
+                st.warning("NG Storage Signal: **NEUTRAL**")
+
+            st.markdown("""
+**How to read this (EIA storage):**
+- **Weekly change** = this week's working gas minus last week.
+  - **Negative** = *withdrawal* (storage falling) → usually **more bullish** in winter.
+  - **Positive** = *injection* (storage rising) → usually **more bearish** in winter.
+- **5-year average (same week)** = the typical seasonal change for this exact week of the year.
+- The app compares **Actual vs 5-year avg**:
+  - If **Actual is more negative** than the 5-year avg (bigger withdrawal / smaller injection), that's **tighter** → **Bullish**.
+  - If **Actual is less negative / more positive** than the 5-year avg, that's **looser** → **Bearish**.
+- **3-week / 7-week avg** smooths noise and shows the trend.
+""")
+
+            cA, cB, cC, cD = st.columns(4)
+            cA.metric("Latest weekly change", f"{actual:+.0f} Bcf")
+            cB.metric("5y avg (same week)", "n/a" if avg5 is None else f"{avg5:+.0f} Bcf")
+            cC.metric("3-week avg", f"{avg3w:+.0f} Bcf")
+            cD.metric("7-week avg", f"{avg7w:+.0f} Bcf")
+
+            if diff_vs_5y is not None:
+                st.caption(f"Diff vs 5-year avg (actual - 5y): {diff_vs_5y:+.0f} Bcf (negative = tighter/bullish)")
+            st.caption(f"Trend (3w - 7w): {trend_w:+.0f} Bcf (more negative = tightening/bullish)")
+
+            # Next 7 days outlook (driver-based, not a guaranteed price forecast)
+            st.markdown("### Next 7 Days Outlook (Driver-Based)")
+            outlook_lines = []
+            if sig == "BULLISH":
+                outlook_lines.append("• Bias: **Up / Bullish** (storage tightening vs normal)")
+            elif sig == "BEARISH":
+                outlook_lines.append("• Bias: **Down / Bearish** (storage looser vs normal)")
+            else:
+                outlook_lines.append("• Bias: **Sideways / Neutral** (mixed drivers)")
+
+            # Use upcoming market forecast input if available
+            try:
+                fc = float(eia_market_forecast_bcf)
+                if fc < 0:
+                    outlook_lines.append(f"• Next EIA expectation: withdrawal forecast {fc:+.0f} Bcf (tends bullish)")
+                else:
+                    outlook_lines.append(f"• Next EIA expectation: injection forecast {fc:+.0f} Bcf (tends bearish)")
+            except Exception:
+                pass
+
+            st.write("\n".join(outlook_lines))
+        except Exception as _e:
+            st.info("5-year avg / signal not available (data issue).")
+
 
         st.caption(
             "Note: This uses the EIA SeriesID API. If you get 400/403, your API key is wrong or blocked. "
@@ -1105,6 +1768,62 @@ def _compute_overall_weighted_gwdd(cities_df: pd.DataFrame, base_f: float, days:
     overall = overall.groupby("date", as_index=False)["weighted_gwdd"].sum()
     overall = overall.rename(columns={"weighted_gwdd": "gwdd_overall_weighted"}).sort_values("date")
     return overall
+
+
+def _compute_us_gwhdd_trend(cities_df: pd.DataFrame, base_f: float, days: int, past_days: int = 7) -> dict:
+    """
+    Compute US Gas-Weighted HDD (GWHDD) actual vs forecast trend.
+    Returns dict with: actual_avg, forecast_avg, delta, label
+    """
+    out = {"actual_avg": None, "forecast_avg": None, "delta": None, "label": "Neutral"}
+
+    frames: List[pd.DataFrame] = []
+    for _, row in cities_df.iterrows():
+        try:
+            hdf = fetch_open_meteo_daily_history(
+                float(row["lat"]), float(row["lon"]),
+                past_days=int(past_days),
+                forecast_days=int(days),
+            )
+            if hdf is None or hdf.empty:
+                continue
+            gw = compute_gwdd(hdf, base_f=base_f).rename(columns={"gwdd": "gwhdd"})
+            gw = gw.merge(hdf[["date", "kind"]], on="date", how="left")
+            gw["weight"] = float(row["weight"])
+            frames.append(gw)
+        except Exception:
+            continue
+
+    if not frames:
+        return out
+
+    df = pd.concat(frames, ignore_index=True)
+    df["w_gwhdd"] = df["gwhdd"] * df["weight"]
+
+    overall = (
+        df.groupby(["date", "kind"], as_index=False)
+        .agg(weighted_sum=("w_gwhdd", "sum"), weight_sum=("weight", "sum"))
+    )
+    overall["gwhdd_w"] = overall["weighted_sum"] / overall["weight_sum"]
+
+    actual = overall[overall["kind"] == "Actual"].sort_values("date")["gwhdd_w"]
+    fcst = overall[overall["kind"] == "Forecast"].sort_values("date")["gwhdd_w"]
+
+    if len(actual):
+        out["actual_avg"] = float(actual.tail(min(7, len(actual))).mean())
+    if len(fcst):
+        out["forecast_avg"] = float(fcst.head(min(7, len(fcst))).mean())
+
+    if out["actual_avg"] is not None and out["forecast_avg"] is not None:
+        out["delta"] = float(out["forecast_avg"] - out["actual_avg"])
+        if out["delta"] >= 1.0:
+            out["label"] = "Bullish (colder / higher demand)"
+        elif out["delta"] <= -1.0:
+            out["label"] = "Bearish (warmer / lower demand)"
+        else:
+            out["label"] = "Neutral"
+    return out
+
 
 
 def _compute_ng_signal(overall_gwdd_df: pd.DataFrame, storage_df_with_change: pd.DataFrame) -> dict:
@@ -1218,7 +1937,7 @@ def _project_next_week_storage(storage_df_with_change: pd.DataFrame, method: str
     return out
 
 
-with tabs[2]:
+with tabs[3]:
     st.header("Signals & Summary")
     st.divider()
     st.subheader("🌡️ NOAA 8–14 Day Temperature Outlook (Weather → NG Demand)")
@@ -1288,6 +2007,15 @@ with tabs[2]:
         else:
             st.metric("Latest storage (BCF)", f"{signal['latest_storage_bcf']:.0f}")
 
+    
+
+    # US GWHDD Trend (Actual vs Forecast)
+    us_tr = _compute_us_gwhdd_trend(cities_df, base_f=base_f, days=days, past_days=7)
+    if us_tr.get("delta") is None:
+        st.caption("US GWHDD Trend: N/A (weather data not available)")
+    else:
+        st.caption(f"US GWHDD Trend: {us_tr['label']}  •  Δ(next7-last7) = {float(us_tr['delta']):+.1f}")
+
     if signal["notes"]:
         st.write("Notes:")
         for n in signal["notes"]:
@@ -1355,7 +2083,7 @@ with tabs[2]:
 # -----------------------------
 # Tab 4: Contracts & Rollover
 # -----------------------------
-with tabs[3]:
+with tabs[4]:
 
     # Holiday set for more accurate rollover estimates (major US holidays + Good Friday)
     years = list(range(dt.date.today().year - 1, dt.date.today().year + 3))
@@ -1497,7 +2225,7 @@ If you trade **NG=F (Yahoo front month)** or CFDs, the rollover behavior can dif
 # -----------------------------
 # Tab 5: NG News
 # -----------------------------
-with tabs[4]:
+with tabs[5]:
     st.subheader("📰 Natural Gas News (Headlines)")
     st.caption("Headlines only (opens sources in a new tab).")
 
@@ -1561,3 +2289,216 @@ with tabs[4]:
                 src = it.get("source") or ""
                 pub = it.get("published") or ""
                 st.markdown(f"- [{t}]({link})  \n  {src}  •  {pub}")
+
+
+# ------------------------------
+# NG Drivers + Auto Signal (NEW)
+# ------------------------------
+def _ema(series, span: int):
+    return series.ewm(span=span, adjust=False).mean()
+
+def compute_ng_price_signal():
+    # Returns dict: {"signal": "Bullish"/"Neutral"/"Bearish", "details": "..."}
+    try:
+        import yfinance as yf
+        dfp = yf.download("NG=F", period="90d", interval="1d", progress=False)
+        if dfp is None or dfp.empty:
+            return {"signal": "Neutral", "details": "Price: no data (yfinance/internet)."}
+        close = dfp["Close"].dropna()
+        if len(close) < 30:
+            return {"signal": "Neutral", "details": "Price: not enough history."}
+
+        ema9 = _ema(close, 9)
+        ema21 = _ema(close, 21)
+
+        last = float(close.iloc[-1])
+        e9 = float(ema9.iloc[-1])
+        e21 = float(ema21.iloc[-1])
+
+        chg5 = float(close.iloc[-1] - close.iloc[-6]) if len(close) >= 6 else 0.0
+
+        if e9 > e21 and chg5 > 0:
+            sig = "Bullish"
+        elif e9 < e21 and chg5 < 0:
+            sig = "Bearish"
+        else:
+            sig = "Neutral"
+
+        details = f"NG=F last={last:.3f} | EMA9={e9:.3f} | EMA21={e21:.3f} | 5D Δ={chg5:.3f}"
+        return {"signal": sig, "details": details}
+    except Exception as e:
+        return {"signal": "Neutral", "details": f"Price: error ({type(e).__name__})."}
+
+def compute_storage_signal_simple(eia_api_key):
+    # Bullish when actual weekly change is lower than 5y avg by >= 10 Bcf (tighter).
+    if not eia_api_key:
+        return {"signal": "Neutral", "details": "Storage: no EIA key."}
+    try:
+        series_id = globals().get("STORAGE_SERIES_ID", "NG.NW2_EPG0_SWO_R48_BCF.W")
+        fetch_fn = globals().get("fetch_eia_series") or globals().get("fetch_eia_series_seriesid")
+        if fetch_fn is None:
+            return {"signal": "Neutral", "details": "Storage: fetch function missing."}
+
+        # fetch_eia_series signature is (series_id, api_key).
+        # Some older helper functions may use (api_key, series_id), so we try both safely.
+        try:
+            stor = fetch_fn(series_id, eia_api_key)
+        except TypeError:
+            stor = fetch_fn(eia_api_key, series_id)
+        if stor is None or stor.empty:
+            return {"signal": "Neutral", "details": "Storage: no data."}
+
+        stor = stor.sort_values("date")
+        stor["weekly_change"] = stor["value"].diff()
+
+        last_row = stor.dropna(subset=["weekly_change"]).iloc[-1:]
+        if last_row.empty:
+            return {"signal": "Neutral", "details": "Storage: not enough data."}
+
+        last_date = last_row["date"].iloc[0]
+        last_change = float(last_row["weekly_change"].iloc[0])
+
+        tmp = stor.copy()
+        tmp["week"] = tmp["date"].dt.isocalendar().week.astype(int)
+        tmp["year"] = tmp["date"].dt.year.astype(int)
+        last_week = int(last_date.isocalendar().week)
+
+        hist = tmp[(tmp["week"] == last_week) & (tmp["year"] < int(last_date.year))].tail(5)
+        hist_changes = hist["weekly_change"].dropna()
+        if hist_changes.empty:
+            avg5 = float(tmp[tmp["week"] == last_week]["weekly_change"].dropna().tail(10).mean())
+        else:
+            avg5 = float(hist_changes.mean())
+
+        diff = last_change - avg5  # negative = tighter
+        if diff <= -10:
+            sig = "Bullish"
+        elif diff >= 10:
+            sig = "Bearish"
+        else:
+            sig = "Neutral"
+
+        details = f"Latest weekly change={last_change:.0f} Bcf | 5y avg (same week)={avg5:.0f} Bcf | diff={diff:.0f} (neg=tighter)"
+        return {"signal": sig, "details": details}
+    except Exception as e:
+        return {"signal": "Neutral", "details": f"Storage: error ({type(e).__name__})."}
+
+def compute_weather_signal_simple(overall_df):
+    # Weather signal from Overall Weighted GWDD (Daily)
+    try:
+        if overall_df is None or getattr(overall_df, "empty", True) or "GWDD_overall_weighted" not in overall_df.columns:
+            return {"signal": "Neutral", "details": "Weather: no GWDD overall data."}
+        d = overall_df.copy().sort_values("date")
+        s = d["GWDD_overall_weighted"].astype(float)
+
+        if len(s) < 14:
+            avg7 = float(s.tail(7).mean())
+            return {"signal": "Neutral", "details": f"Weather: 7D avg={avg7:.2f} (need more history)."}
+
+        avg7_now = float(s.tail(7).mean())
+        avg7_prev = float(s.tail(14).head(7).mean())
+        delta = avg7_now - avg7_prev
+
+        if delta > 1.0 and avg7_now >= 18:
+            sig = "Bullish"
+        elif delta < -1.0 and avg7_now <= 16:
+            sig = "Bearish"
+        else:
+            sig = "Neutral"
+
+        details = f"GWDD 7D avg={avg7_now:.2f} | prev7={avg7_prev:.2f} | Δ={delta:+.2f}"
+        return {"signal": sig, "details": details}
+    except Exception as e:
+        return {"signal": "Neutral", "details": f"Weather: error ({type(e).__name__})."}
+
+def combine_signals(s_weather, s_storage, s_price):
+    weight = {"Weather": 0.4, "Storage": 0.4, "Price": 0.2}
+    score_map = {"Bearish": -1, "Neutral": 0, "Bullish": 1}
+    score = (
+        score_map.get(s_weather.get("signal"), 0) * weight["Weather"]
+        + score_map.get(s_storage.get("signal"), 0) * weight["Storage"]
+        + score_map.get(s_price.get("signal"), 0) * weight["Price"]
+    )
+    if score >= 0.35:
+        sig = "Bullish"
+    elif score <= -0.35:
+        sig = "Bearish"
+    else:
+        sig = "Neutral"
+    return sig, score
+
+with tabs[0]:
+    st.header("NG Drivers + Auto Signal")
+
+    auto_refresh = st.checkbox("Auto-refresh every 60 seconds", value=False)
+    refresh_now = st.button("Refresh now")
+
+    # Try to get EIA key (sidebar input likely sets st.session_state)
+    eia_key = st.session_state.get("EIA_API_KEY") if "EIA_API_KEY" in st.session_state else None
+    # st.secrets throws StreamlitSecretNotFoundError if no secrets.toml exists, so guard with try/except
+    if not eia_key:
+        try:
+            secrets_obj = st.secrets
+            if "EIA_API_KEY" in secrets_obj:
+                eia_key = secrets_obj.get("EIA_API_KEY")
+        except Exception:
+            pass
+
+    overall_df = st.session_state.get("overall_disp") if "overall_disp" in st.session_state else None
+
+    weather_sig = compute_weather_signal_simple(overall_df)
+    storage_sig = compute_storage_signal_simple(eia_key)
+    price_sig = compute_ng_price_signal()
+
+    final_sig, final_score = combine_signals(weather_sig, storage_sig, price_sig)
+
+    if final_sig == "Bullish":
+        st.success(f"Overall NG Signal: {final_sig} (score={final_score:+.2f})")
+    elif final_sig == "Bearish":
+        st.error(f"Overall NG Signal: {final_sig} (score={final_score:+.2f})")
+    else:
+        st.info(f"Overall NG Signal: {final_sig} (score={final_score:+.2f})")
+
+    st.subheader("Signal breakdown")
+    st.write(f"**Weather:** {weather_sig['signal']} — {weather_sig['details']}")
+    st.write(f"**Storage:** {storage_sig['signal']} — {storage_sig['details']}")
+    st.write(f"**Price/Trend:** {price_sig['signal']} — {price_sig['details']}")
+
+    st.subheader("What usually makes NG Bullish / Bearish (explained)")
+    st.markdown(
+        """
+**Bullish (price up) when:**
+- **Colder-than-normal weather (higher HDD/GWDD)** → demand rises for heating.
+- **Smaller injection / bigger withdrawal than normal** (storage “tighter” vs 5y avg).
+- **LNG exports strong** and pipeline exports strong.
+- **Production drops** (freeze-offs, maintenance) or **rigs fall**.
+- **Power burn increases** (hot summer, coal-to-gas switching).
+- **Backwardation** (near contract > later) often supports.
+
+**Bearish (price down) when:**
+- **Warmer-than-normal** (lower HDD/GWDD) → demand weak.
+- **Bigger injection / smaller withdrawal than normal** (storage “looser” vs 5y avg).
+- **Production grows** and supply stays high.
+- **LNG outages** (export terminals down) or export demand weak.
+- **Contango** (later contract > near) can pressure front month.
+        """
+    )
+
+    st.subheader("Live Drivers (Auto)")
+    cols = st.columns(2)
+    with cols[0]:
+        _render_lng_tracker()
+        _render_freezeoff_alert()
+    with cols[1]:
+        _render_backwardation_detector()
+        _render_power_burn_score(eia_key)
+
+
+    # (removed empty subheader placeholder)
+
+    if auto_refresh and not refresh_now:
+        import time
+        time.sleep(60)
+        st.experimental_rerun()
+    elif refresh_now:
+        st.experimental_rerun()
