@@ -33,6 +33,45 @@ except Exception:
 
 
 # -----------------------------
+# Small local stores (persist simple "yesterday" values)
+# -----------------------------
+_GWDD_STORE = Path("gwdd_daily_store.json")
+
+
+def _load_json_store(p: Path) -> dict:
+    try:
+        if p.exists():
+            return json.loads(p.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def _save_json_store(p: Path, data: dict) -> None:
+    try:
+        p.write_text(json.dumps(data, indent=2))
+    except Exception:
+        # read-only environments: keep in session
+        st.session_state[f"_store_fallback_{p.name}"] = data
+
+
+def _get_store_value(p: Path, key: str):
+    data = _load_json_store(p)
+    if key in data:
+        return data.get(key)
+    fb = st.session_state.get(f"_store_fallback_{p.name}", {})
+    if isinstance(fb, dict):
+        return fb.get(key)
+    return None
+
+
+def _set_store_value(p: Path, key: str, val) -> None:
+    data = _load_json_store(p)
+    data[key] = val
+    _save_json_store(p, data)
+
+
+# -----------------------------
 # Fast HTTP (connection reuse)
 # -----------------------------
 _HTTP = requests.Session()
@@ -119,6 +158,81 @@ def project_ng_prices_next_5_days(hist: pd.DataFrame) -> pd.DataFrame:
         rows.append({"date": d, "projected": proj, "low": proj - band, "high": proj + band})
 
     return pd.DataFrame(rows)
+
+
+# -----------------------------
+# Intraday helpers (VWAP / key levels)
+# -----------------------------
+@st.cache_data(ttl=60*5, show_spinner=False)
+def fetch_ng_intraday(ticker: str = "NG=F", period: str = "2d", interval: str = "5m") -> pd.DataFrame:
+    """Intraday history for VWAP/key levels. Returns columns: datetime, open, high, low, close, volume."""
+    if yf is None:
+        return pd.DataFrame(columns=["datetime", "open", "high", "low", "close", "volume"])
+    try:
+        df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=False)
+        if df is None or df.empty:
+            return pd.DataFrame(columns=["datetime", "open", "high", "low", "close", "volume"])
+        out = df.copy().reset_index()
+        # yfinance index may be named Datetime or Date
+        dt_col = out.columns[0]
+        out = out.rename(columns={
+            dt_col: "datetime",
+            "Open": "open",
+            "High": "high",
+            "Low": "low",
+            "Close": "close",
+            "Volume": "volume",
+        })
+        for c in ["open", "high", "low", "close", "volume"]:
+            if c not in out.columns:
+                out[c] = np.nan
+        out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+        out = out.dropna(subset=["datetime", "close"]).sort_values("datetime")
+        # volume missing sometimes
+        out["volume"] = pd.to_numeric(out["volume"], errors="coerce").fillna(0.0)
+        return out[["datetime", "open", "high", "low", "close", "volume"]]
+    except Exception:
+        return pd.DataFrame(columns=["datetime", "open", "high", "low", "close", "volume"])
+
+
+def compute_vwap_and_levels(intra: pd.DataFrame) -> dict:
+    """Compute today's VWAP (or mean close fallback) and yesterday high/low from intraday bars."""
+    out = {
+        "last": None,
+        "vwap": None,
+        "yday_high": None,
+        "yday_low": None,
+    }
+    if intra is None or intra.empty:
+        return out
+    try:
+        last = float(intra["close"].dropna().iloc[-1])
+        out["last"] = last
+    except Exception:
+        pass
+
+    try:
+        intra = intra.dropna(subset=["datetime", "close"]).copy()
+        intra["date"] = intra["datetime"].dt.date
+        today = dt.date.today()
+
+        today_df = intra[intra["date"] == today]
+        if not today_df.empty:
+            vol = today_df["volume"].astype(float)
+            px = today_df["close"].astype(float)
+            if float(vol.sum()) > 0:
+                out["vwap"] = float((px * vol).sum() / vol.sum())
+            else:
+                out["vwap"] = float(px.mean())
+
+        yday = today - dt.timedelta(days=1)
+        ydf = intra[intra["date"] == yday]
+        if not ydf.empty:
+            out["yday_high"] = float(ydf["high"].astype(float).max()) if "high" in ydf.columns else float(ydf["close"].astype(float).max())
+            out["yday_low"] = float(ydf["low"].astype(float).min()) if "low" in ydf.columns else float(ydf["close"].astype(float).min())
+    except Exception:
+        pass
+    return out
 
 
 
@@ -762,7 +876,7 @@ def main():
     
             <div id="netflix-loader">
               <div class="ring"></div>
-              <div class="title">Please wait… we pull fresh data for you</div>
+              <div class="title">“Please wait while we pull fresh data for you.”</div>
               <div class="sub">Loading live weather, storage, and signals</div>
             </div>
             """,
@@ -819,6 +933,18 @@ def main():
 
         # Keep key in session_state so other tabs (Drivers) can read it reliably
         st.session_state["EIA_API_KEY"] = str(api_key).strip() if api_key is not None else ""
+
+        # Manual force-refresh to bypass Streamlit cache TTL (useful right after EIA release)
+        if st.button("Force refresh data now", help="Clears cached data and re-fetches immediately (EIA, weather, prices)"):
+            try:
+                st.cache_data.clear()
+            except Exception:
+                pass
+            # rerun
+            try:
+                st.rerun()
+            except Exception:
+                st.experimental_rerun()
 
         # Market expectation for the *next* EIA storage report (manual entry).
         # Negative = expected withdrawal, Positive = expected injection.
@@ -1191,6 +1317,89 @@ def main():
             st.info("Freeze‑off alert: Neutral‑to‑Bullish (Medium risk in at least one key region)")
         else:
             st.error("Freeze‑off alert: Bearish/Neutral (Low freeze risk)")
+
+
+    # --- Computation-only helpers (used by Signals tab; no UI side effects) ---
+    @st.cache_data(ttl=60*30, show_spinner=False)
+    def compute_freezeoff_worst_score() -> dict:
+        """Returns worst freeze risk score across key production regions.
+        score: 1=High, 0.5=Medium, 0=Low (weather-based proxy)."""
+        points = [
+            ("Permian (Midland, TX)", 31.9973, -102.0779),
+            ("Oklahoma (OKC, OK)", 35.4676, -97.5164),
+            ("Haynesville (Shreveport, LA)", 32.5252, -93.7502),
+            ("Appalachia (Pittsburgh, PA)", 40.4406, -79.9959),
+        ]
+        worst = 0.0
+        coldest_any = None
+        for _, lat, lon in points:
+            try:
+                df = _open_meteo_daily_minmax(lat, lon, days=7)
+                if df is None or df.empty:
+                    continue
+                coldest = float(df["tmin_c"].min())
+                coldest_any = coldest if coldest_any is None else min(coldest_any, coldest)
+                if coldest <= -10:
+                    worst = max(worst, 1.0)
+                elif coldest <= -5:
+                    worst = max(worst, 0.5)
+            except Exception:
+                continue
+        label = "Low"
+        if worst >= 1.0:
+            label = "High"
+        elif worst >= 0.5:
+            label = "Medium"
+        return {"worst_score": float(worst), "risk": label, "coldest_c": coldest_any}
+
+
+    @st.cache_data(ttl=60*30, show_spinner=False)
+    def compute_lng_proxy_signal(api_key: str, lng_series: str = "NG.N9133US2.M", pipe_series: str = "NG.N9132US2.M") -> dict:
+        """Trend-based LNG/pipeline exports proxy (Bullish/Neutral/Bearish)"""
+        api_key = str(api_key or "").strip()
+        if not api_key:
+            return {"score": 0, "label": "Neutral", "pct_lng": 0.0, "pct_pipe": 0.0}
+
+        def _trend_label(vals: list[float]) -> tuple[str, float]:
+            if len(vals) < 6:
+                return "Neutral", 0.0
+            a = float(np.mean(vals[-3:]))
+            b = float(np.mean(vals[-6:-3]))
+            if b == 0:
+                return "Neutral", 0.0
+            pct = (a - b) / abs(b)
+            if pct >= 0.02:
+                return "Bullish", pct
+            if pct <= -0.02:
+                return "Bearish", pct
+            return "Neutral", pct
+
+        try:
+            df_lng = fetch_eia_series(str(lng_series).strip(), api_key=api_key)
+            lng_vals = df_lng["value"].dropna().astype(float).tolist() if df_lng is not None else []
+        except Exception:
+            lng_vals = []
+
+        try:
+            df_pipe = fetch_eia_series(str(pipe_series).strip(), api_key=api_key)
+            pipe_vals = df_pipe["value"].dropna().astype(float).tolist() if df_pipe is not None else []
+        except Exception:
+            pipe_vals = []
+
+        sig_lng, pct_lng = _trend_label(lng_vals) if lng_vals else ("Neutral", 0.0)
+        sig_pipe, pct_pipe = _trend_label(pipe_vals) if pipe_vals else ("Neutral", 0.0)
+
+        score = 0
+        score += 1 if sig_lng == "Bullish" else (-1 if sig_lng == "Bearish" else 0)
+        score += 1 if sig_pipe == "Bullish" else (-1 if sig_pipe == "Bearish" else 0)
+
+        if score >= 1:
+            label = "Bullish"
+        elif score <= -1:
+            label = "Bearish"
+        else:
+            label = "Neutral"
+        return {"score": int(score), "label": label, "pct_lng": float(pct_lng), "pct_pipe": float(pct_pipe)}
 
     def _render_backwardation_detector():
         st.subheader("Backwardation detector (front vs next contract)")
@@ -2080,6 +2289,149 @@ def main():
     with tabs[3]:
         st.header("Signals & Summary")
         st.divider()
+
+        # -----------------------------
+        # Daily Trading Checklist (auto-updated)
+        # -----------------------------
+        overall = _compute_overall_weighted_gwdd(cities_df, base_f=base_f, days=days)
+        next7_avg = None
+        try:
+            if overall is not None and not overall.empty:
+                next7_avg = float(overall["gwdd_overall_weighted"].astype(float).head(7).mean())
+        except Exception:
+            next7_avg = None
+
+        # GWDD change vs yesterday (best effort)
+        today = dt.date.today()
+        yday = today - dt.timedelta(days=1)
+        stored_yday = _get_store_value(_GWDD_STORE, yday.isoformat())
+        if stored_yday is None:
+            # fallback to last stored value if yesterday not present
+            stored_yday = _get_store_value(_GWDD_STORE, "_last")
+        if next7_avg is not None:
+            _set_store_value(_GWDD_STORE, today.isoformat(), float(next7_avg))
+            _set_store_value(_GWDD_STORE, "_last", float(next7_avg))
+
+        gwdd_delta = None
+        if next7_avg is not None and stored_yday is not None:
+            try:
+                gwdd_delta = float(next7_avg) - float(stored_yday)
+            except Exception:
+                gwdd_delta = None
+
+        # Mid-day pattern shift (vs previous refresh)
+        prev_next7 = st.session_state.get("_prev_next7_avg")
+        prev_time = st.session_state.get("_prev_next7_avg_ts")
+        st.session_state["_prev_next7_avg"] = next7_avg
+        st.session_state["_prev_next7_avg_ts"] = dt.datetime.now().isoformat(timespec="seconds")
+        midday_shift = None
+        if next7_avg is not None and prev_next7 is not None:
+            try:
+                midday_shift = float(next7_avg) - float(prev_next7)
+            except Exception:
+                midday_shift = None
+
+        # Storage latest (optional)
+        storage_with_change = None
+        if api_key and str(api_key).strip():
+            try:
+                stor_sig = fetch_eia_series(EIA_SERIES_TOTAL_R48, api_key=str(api_key).strip())
+                storage_with_change = compute_weekly_change(stor_sig)
+            except Exception:
+                storage_with_change = None
+
+        # LNG proxy & freeze-off proxy (optional)
+        lng_proxy = compute_lng_proxy_signal(str(api_key).strip()) if (api_key and str(api_key).strip()) else {"score": 0, "label": "Neutral", "pct_lng": 0.0, "pct_pipe": 0.0}
+        freeze_proxy = compute_freezeoff_worst_score()
+
+        # Price vs VWAP / key levels
+        intra = fetch_ng_intraday("NG=F")
+        vwap_levels = compute_vwap_and_levels(intra)
+
+        def _bulbear_from_delta(d: float | None, thr: float) -> str:
+            if d is None:
+                return "Neutral"
+            if d > thr:
+                return "Bullish"
+            if d < -thr:
+                return "Bearish"
+            return "Neutral"
+
+        gwdd_sig = _bulbear_from_delta(gwdd_delta, thr=0.5)
+        # For intraday model shift, use smaller threshold (noise)
+        midday_sig = _bulbear_from_delta(midday_shift, thr=0.25)
+        lng_sig = lng_proxy.get("label", "Neutral")
+        freeze_sig = "Bullish" if float(freeze_proxy.get("worst_score", 0.0) or 0.0) >= 0.5 else "Neutral"
+
+        price_sig = "Neutral"
+        last_px = vwap_levels.get("last")
+        vwap_px = vwap_levels.get("vwap")
+        if last_px is not None and vwap_px is not None:
+            if float(last_px) > float(vwap_px):
+                price_sig = "Bullish"
+            elif float(last_px) < float(vwap_px):
+                price_sig = "Bearish"
+
+        # Overall score (simple)
+        score = 0
+        for s in [gwdd_sig, midday_sig, lng_sig, freeze_sig, price_sig]:
+            score += 1 if s == "Bullish" else (-1 if s == "Bearish" else 0)
+
+        if score >= 2:
+            overall_bias = "Bullish"
+        elif score <= -2:
+            overall_bias = "Bearish"
+        else:
+            overall_bias = "Neutral"
+
+        # HNU/HND mapping (simple): HNU = bullish NG, HND = bearish NG
+        hnu_bias = "Bullish" if overall_bias == "Bullish" else ("Bearish" if overall_bias == "Bearish" else "Neutral")
+        hnd_bias = "Bullish" if overall_bias == "Bearish" else ("Bearish" if overall_bias == "Bullish" else "Neutral")
+
+        st.subheader("✅ Daily Trading Checklist (Auto)")
+        m1, m2, m3, m4 = st.columns(4)
+        with m1:
+            st.metric("Next 2–3 days bias", overall_bias, f"score {score:+d}")
+        with m2:
+            st.metric("HNU bias", hnu_bias)
+        with m3:
+            st.metric("HND bias", hnd_bias)
+        with m4:
+            st.caption("Auto-updates when you refresh / rerun")
+
+        # Details
+        d1, d2, d3, d4, d5 = st.columns(5)
+        with d1:
+            st.write("**HDD/GWDD vs yesterday**")
+            if gwdd_delta is None:
+                st.write("Signal: Neutral (need 1 day history)")
+            else:
+                st.write(f"Signal: **{gwdd_sig}**  (Δ next7 avg = {gwdd_delta:+.2f})")
+        with d2:
+            st.write("**Mid‑day model shift**")
+            if midday_shift is None or prev_time is None:
+                st.write("Signal: Neutral (refresh once to compare)")
+            else:
+                change_txt = "added cold" if midday_shift > 0 else ("removed cold" if midday_shift < 0 else "no change")
+                st.write(f"Signal: **{midday_sig}**  (Δ={midday_shift:+.2f}, {change_txt})")
+        with d3:
+            st.write("**Production / supply proxy**")
+            if freeze_proxy.get("risk") is None:
+                st.write("Signal: Neutral")
+            else:
+                st.write(f"Freeze risk: {freeze_proxy.get('risk')} → **{freeze_sig}**")
+        with d4:
+            st.write("**LNG feedgas proxy**")
+            st.write(f"Signal: **{lng_sig}**  (LNG {lng_proxy.get('pct_lng',0.0)*100:+.1f}%, Pipe {lng_proxy.get('pct_pipe',0.0)*100:+.1f}%)")
+        with d5:
+            st.write("**Price vs VWAP**")
+            if last_px is None or vwap_px is None:
+                st.write("Signal: Neutral (no intraday data)")
+            else:
+                st.write(f"Signal: **{price_sig}**  (Last {float(last_px):.3f} vs VWAP {float(vwap_px):.3f})")
+
+        st.divider()
+
         st.subheader("🌡️ NOAA 8–14 Day Temperature Outlook (Weather → NG Demand)")
 
         colA, colB = st.columns([2, 1])
@@ -2145,19 +2497,7 @@ def main():
                 st.dataframe(pl_show, use_container_width=True, hide_index=True)
                 st.caption("ਇਹ P/L **approx** ਹੈ—broker fees, slippage, leverage/ETF decay (HNU), rollover ਆਦਿ include ਨਹੀਂ।")
 
-
-        # Build fresh (cached) data needed for the signal
-        overall = _compute_overall_weighted_gwdd(cities_df, base_f=base_f, days=days)
-
-        storage_with_change = None
-        if api_key and str(api_key).strip():
-            try:
-                stor_sig = fetch_eia_series(EIA_SERIES_TOTAL_R48, api_key=str(api_key).strip())
-                storage_with_change = compute_weekly_change(stor_sig)
-            except Exception as e:
-                storage_with_change = None
-                st.warning(f"EIA fetch failed for signals: {e}")
-
+        # (Reuse the data already computed at the top of this tab)
         signal = _compute_ng_signal(overall, storage_with_change)
 
         # Top signal box
