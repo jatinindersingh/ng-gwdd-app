@@ -2,7 +2,6 @@ streamlit
 pandas
 numpy
 requests>=2.31.0
-openpyxl
 yfinance>=0.2.40
 matplotlib
 plotly
@@ -10,3 +9,5 @@ feedparser
 lxml
 html5lib
 beautifulsoup4
+
+
