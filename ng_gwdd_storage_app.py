@@ -948,10 +948,16 @@ def main():
 
         # Market expectation for the *next* EIA storage report (manual entry).
         # Negative = expected withdrawal, Positive = expected injection.
+        # IMPORTANT: persist value across refresh AND reload saved value after restart.
+        next_report_date_sidebar = estimate_next_eia_report_date(dt.date.today())
+        saved_fc_sidebar = _get_saved_forecast(next_report_date_sidebar)
+        if "eia_market_forecast_bcf" not in st.session_state:
+            st.session_state["eia_market_forecast_bcf"] = float(saved_fc_sidebar) if saved_fc_sidebar is not None else -107.0
+
         eia_market_forecast_bcf = st.number_input(
             "Next EIA report market forecast (BCF)",
-            value=-107.0,
             step=1.0,
+            key="eia_market_forecast_bcf",
             help="Enter the market/analyst estimate for the upcoming EIA storage change. Example: -107 = expected 107 Bcf withdrawal.",
         )
     auto_refresh = st.checkbox("Auto refresh every 1 minute", value=False)
@@ -1787,23 +1793,22 @@ def main():
                         st.metric("Surprise (actual - forecast)", "N/A")
                     else:
                         ld = latest_pack.get("latest_period_date")
+
+                        # Saved forecast for the *same report date* (optional, for reference only)
                         saved_fc = _get_saved_forecast(ld) if ld else None
 
-                        # --- AUTO SURPRISE fallback (added) ---
-                        # If there is no saved forecast for this report date, use the current market forecast input
-                        # and save it automatically so Surprise always updates.
-                        if saved_fc is None:
-                            try:
-                                saved_fc = float(eia_market_forecast_bcf)
-                            except Exception:
-                                saved_fc = None
-                            if (ld is not None) and (saved_fc is not None):
-                                _set_saved_forecast(ld, saved_fc)
+                        # IMPORTANT: Surprise shown here should match the "Forecast (market)" number on the screen.
+                        # So we always compare Actual (latest) vs the CURRENT market forecast input.
+                        try:
+                            fc_for_surprise = float(eia_market_forecast_bcf)
+                        except Exception:
+                            fc_for_surprise = None
 
-                        if saved_fc is None:
+                        if fc_for_surprise is None or actual_chg is None:
                             st.metric("Surprise (actual - forecast)", "N/A")
                         else:
-                            surprise = float(actual_chg) - float(saved_fc)
+                            surprise = float(actual_chg) - float(fc_for_surprise)
+
 
                             # --- Color-coded Surprise + Alert (added) ---
                             # Interpretation: more negative surprise = bigger withdrawal / tighter than expected => bullish NG
