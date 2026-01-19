@@ -19,461 +19,6 @@ import matplotlib.pyplot as plt
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ==============================
-# Worldwide Bullish Dashboard Tab (embedded)
-# ==============================
-def render_bullish_dashboard():
-    import streamlit as st
-    import requests
-    import pandas as pd
-    from datetime import datetime, timedelta
-    import time
-
-    st.header('🌍 Worldwide Bullish Dashboard')
-    st.caption(f"Last refresh: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-
-    
-    
-    # -----------------------------
-    # Sidebar controls
-    # -----------------------------
-    st.sidebar.header("Controls")
-    auto = st.sidebar.checkbox("Auto Refresh", value=False)
-    refresh_mins = st.sidebar.selectbox("Refresh every (minutes)", [5, 10, 30], index=1)
-    threshold = st.sidebar.slider("Alert threshold (score)", 1, 8, 6)
-    
-    # Keep auto-refresh safe: rerun AFTER data loads (bottom of app)
-    # We'll set a flag and rerun at the end.
-    do_autorefresh = auto
-    
-    # -----------------------------
-    # Helpers
-    # -----------------------------
-    def http_get(url, params=None, headers=None, timeout=25):
-        h = headers or {}
-        if "User-Agent" not in h:
-            h["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-        r = requests.get(url, params=params, headers=h, timeout=timeout)
-        r.raise_for_status()
-        return r
-    
-    def safe_float(x):
-        try:
-            return float(str(x).replace(",", "").strip())
-        except Exception:
-            return None
-    
-    # -----------------------------
-    # 1) Price Trend (LIVE) - EIA dnav Daily table parse
-    # -----------------------------
-    @st.cache_data(ttl=60 * 30)
-    def eia_henry_hub_last_values(n=5):
-        """
-        Parses EIA dnav daily Henry Hub table and returns last n numeric daily values.
-        """
-        url = "https://www.eia.gov/dnav/ng/hist/rngwhhdd.htm"
-        html = http_get(url, timeout=25).text
-        tables = pd.read_html(html)
-        df = max(tables, key=lambda t: t.shape[0] * t.shape[1]).copy()
-    
-        cols_l = [str(c).strip().lower() for c in df.columns]
-        day_map = {}
-        for d in ["mon", "tue", "wed", "thu", "fri"]:
-            for i, c in enumerate(cols_l):
-                if c == d:
-                    day_map[d] = df.columns[i]
-    
-        seq = []
-        for idx in range(len(df)):
-            row = df.iloc[idx]
-            for d in ["mon", "tue", "wed", "thu", "fri"]:
-                if d in day_map:
-                    v = safe_float(row.get(day_map[d]))
-                    if v is not None:
-                        seq.append(v)
-    
-        return seq[-n:] if len(seq) >= 1 else []
-    
-    def price_trend_score(last_vals):
-        if len(last_vals) < 2:
-            return 1, "Price trend not enough data."
-        first, last = last_vals[0], last_vals[-1]
-        if last > first:
-            return 2, f"Price up ✅ ({first:.2f} → {last:.2f})"
-        elif last < first:
-            return 0, f"Price down ({first:.2f} → {last:.2f})"
-        return 1, "Price flat."
-    
-    # -----------------------------
-    # 2) Weather / HDD Strength (LIVE) - Open-Meteo (no key)
-    # -----------------------------
-    CITY_WEIGHTS = [
-        ("Chicago", 41.8781, -87.6298, 0.18),
-        ("New York", 40.7128, -74.0060, 0.18),
-        ("Boston", 42.3601, -71.0589, 0.10),
-        ("Philadelphia", 39.9526, -75.1652, 0.08),
-        ("Detroit", 42.3314, -83.0458, 0.08),
-        ("Minneapolis", 44.9778, -93.2650, 0.10),
-        ("Dallas", 32.7767, -96.7970, 0.08),
-        ("Atlanta", 33.7490, -84.3880, 0.06),
-        ("Denver", 39.7392, -104.9903, 0.06),
-        ("St. Louis", 38.6270, -90.1994, 0.08),
-    ]
-    
-    @st.cache_data(ttl=60 * 60)
-    def open_meteo_hdd_7d(lat, lon):
-        url = "https://api.open-meteo.com/v1/forecast"
-        params = {
-            "latitude": lat,
-            "longitude": lon,
-            "daily": "temperature_2m_max,temperature_2m_min",
-            "temperature_unit": "fahrenheit",
-            "timezone": "auto",
-            "forecast_days": 7
-        }
-        j = http_get(url, params=params, timeout=20).json()
-        d = j.get("daily", {})
-        tmin = d.get("temperature_2m_min", [])
-        tmax = d.get("temperature_2m_max", [])
-        if not tmin or not tmax:
-            return None
-        hdds = []
-        for a, b in zip(tmin, tmax):
-            mean = (float(a) + float(b)) / 2.0
-            hdds.append(max(0.0, 65.0 - mean))
-        return sum(hdds)
-    
-    def weather_hdd_strength_score():
-        total = 0.0
-        ok = False
-        for name, lat, lon, w in CITY_WEIGHTS:
-            v = open_meteo_hdd_7d(lat, lon)
-            if v is None:
-                continue
-            ok = True
-            total += v * w
-    
-        if not ok:
-            return 1, "Weather data not reachable right now."
-    
-        if total >= 110:
-            return 2, f"HDD strength bullish ✅ (7-day weighted HDD ≈ {total:.1f})"
-        elif total >= 85:
-            return 1, f"HDD strength neutral (7-day weighted HDD ≈ {total:.1f})"
-        else:
-            return 0, f"HDD strength weak (7-day weighted HDD ≈ {total:.1f})"
-    
-    # -----------------------------
-    # 3) Storage (LIVE) - EIA dnav storage weekly table
-    # -----------------------------
-    @st.cache_data(ttl=60 * 60)
-    def eia_storage_latest_two():
-        url = "https://www.eia.gov/dnav/ng/hist/nw2_epg0_swo_r48_bcfw.htm"
-        html = http_get(url, timeout=25).text
-        df = max(pd.read_html(html), key=lambda t: t.shape[0] * t.shape[1]).copy()
-    
-        # Find a column that contains "Value"
-        val_col = None
-        for c in df.columns:
-            if "value" in str(c).lower():
-                val_col = c
-                break
-    
-        if val_col is not None:
-            s = pd.to_numeric(df[val_col].astype(str).str.replace(",", ""), errors="coerce").dropna()
-            if len(s) >= 2:
-                return float(s.iloc[-1]), float(s.iloc[-2])
-    
-        # brute fallback
-        nums = []
-        for i in range(len(df) - 1, -1, -1):
-            for v in df.iloc[i].tolist():
-                x = safe_float(v)
-                if x is not None:
-                    nums.append(x)
-                    if len(nums) >= 2:
-                        return nums[0], nums[1]
-        return None, None
-    
-    def storage_score(latest, prev):
-        if latest is None or prev is None:
-            return 1, "Storage not reachable right now."
-        change = latest - prev
-        if change < 0:
-            return 2, f"Storage bullish ✅ (weekly draw {change:.0f} Bcf)"
-        elif change > 0:
-            return 0, f"Storage bearish (weekly injection +{change:.0f} Bcf)"
-        return 1, "Storage flat."
-    
-    # -----------------------------
-    # 4) Production (LIVE proxy) - EIA dnav dry production (monthly)
-    # -----------------------------
-    @st.cache_data(ttl=24 * 60 * 60)
-    def eia_dry_production_latest_two():
-        url = "https://www.eia.gov/dnav/ng/hist/n9070us2m.htm"
-        html = http_get(url, timeout=25).text
-        df = max(pd.read_html(html), key=lambda t: t.shape[0] * t.shape[1]).copy()
-    
-        # Find a column that contains "Value"
-        val_col = None
-        for c in df.columns:
-            if "value" in str(c).lower():
-                val_col = c
-                break
-    
-        if val_col is not None:
-            s = pd.to_numeric(df[val_col].astype(str).str.replace(",", ""), errors="coerce").dropna()
-            if len(s) >= 2:
-                return float(s.iloc[-1]), float(s.iloc[-2])
-    
-        nums = []
-        for i in range(len(df) - 1, -1, -1):
-            for v in df.iloc[i].tolist():
-                x = safe_float(v)
-                if x is not None:
-                    nums.append(x)
-                    if len(nums) >= 2:
-                        return nums[0], nums[1]
-        return None, None
-    
-    def production_score(latest, prev):
-        if latest is None or prev is None:
-            return 1, "Production not reachable right now."
-        if latest < prev:
-            return 2, "Production bullish ✅ (down vs previous)."
-        elif latest > prev:
-            return 0, "Production bearish (up vs previous)."
-        return 1, "Production flat."
-    
-    # -----------------------------
-    # 5) Geopolitics (LIVE) - GDELT
-    # -----------------------------
-    @st.cache_data(ttl=10 * 60)
-    def gdelt_total_articles(query: str, hours: int = 24) -> int:
-        end = datetime.utcnow()
-        start = end - timedelta(hours=hours)
-        start_str = start.strftime("%Y%m%d%H%M%S")
-        end_str = end.strftime("%Y%m%d%H%M%S")
-    
-        url = "https://api.gdeltproject.org/api/v2/doc/doc"
-        params = {
-            "query": query,
-            "mode": "ArtList",
-            "format": "json",
-            "maxrecords": 1,
-            "startdatetime": start_str,
-            "enddatetime": end_str,
-        }
-        try:
-            j = http_get(url, params=params, timeout=15).json()
-            return int(j.get("totalArticles", 0))
-        except Exception:
-            return 0
-    
-    def geopolitics_live_score():
-        q = '(LNG OR "natural gas" OR "gas pipeline") AND (sanctions OR blockade OR missile OR war OR "port closure" OR "shipping disruption" OR "strait")'
-        articles = gdelt_total_articles(q, hours=24)
-        if articles >= 500:
-            return 2, f"High disruption headlines (24h articles: {articles})"
-        elif articles >= 200:
-            return 1, f"Moderate disruption headlines (24h articles: {articles})"
-        return 0, f"Low disruption headlines (24h articles: {articles})"
-    
-    # -----------------------------
-    # 6) Coal-to-Gas switching (Official proxy)
-    # -----------------------------
-    def coal_to_gas_switching_live(hh_price):
-        if hh_price is None:
-            return 1, "Gas spot not available (try again later)."
-        if hh_price <= 2.75:
-            return 2, f"Switching bullish ✅ (Henry Hub {hh_price:.2f} is cheap)"
-        elif hh_price <= 3.50:
-            return 1, f"Switching neutral (Henry Hub {hh_price:.2f})"
-        return 0, f"Switching less supportive (Henry Hub {hh_price:.2f} is expensive)"
-    
-    # -----------------------------
-    # 7) Futures Curve (Official) - CME settlements
-    # -----------------------------
-    @st.cache_data(ttl=60 * 60)
-    def cme_ng_settlements_table():
-        url = "https://www.cmegroup.com/markets/energy/natural-gas/natural-gas.settlements.html"
-        try:
-            html = http_get(url, timeout=25).text
-            tables = pd.read_html(html)
-            for t in tables:
-                cols = [str(c).lower() for c in t.columns]
-                if any("settle" in c for c in cols) and (any("month" in c for c in cols) or any("contract" in c for c in cols)):
-                    return t
-            return None
-        except Exception:
-            return None
-    
-    def futures_curve_score_from_cme(df):
-        if df is None or df.empty:
-            return 1, "CME settlements not reachable right now."
-        settle_col = None
-        for c in df.columns:
-            if "settle" in str(c).lower():
-                settle_col = c
-                break
-        if settle_col is None:
-            return 1, "CME parsed but settle column not found."
-        dfx = df.copy().head(12)
-        dfx[settle_col] = pd.to_numeric(dfx[settle_col], errors="coerce")
-        settles = dfx[settle_col].dropna().tolist()
-        if len(settles) < 3:
-            return 1, "Not enough curve points."
-        front, later = settles[0], settles[-1]
-        if front > later:
-            return 2, f"Backwardation ✅ (front {front:.3f} > later {later:.3f})"
-        elif front < later:
-            return 0, f"Contango (front {front:.3f} < later {later:.3f})"
-        return 1, "Flat curve."
-    
-    # -----------------------------
-    # 8) Money Flow (Weekly) placeholder
-    # -----------------------------
-    def money_flow_live_placeholder():
-        return 1, "COT is weekly; full live parser can be added next."
-    
-    # =============================
-    # Load data + compute scores
-    # =============================
-    err = None
-    try:
-        last5 = eia_henry_hub_last_values(5)
-    except Exception as e:
-        last5 = []
-        err = f"Price fetch error: {e}"
-    
-    hh_price = last5[-1] if last5 else None
-    
-    score1, msg1 = price_trend_score(last5)
-    score2, msg2 = weather_hdd_strength_score()
-    
-    s_latest, s_prev = (None, None)
-    try:
-        s_latest, s_prev = eia_storage_latest_two()
-    except Exception:
-        pass
-    score3, msg3 = storage_score(s_latest, s_prev)
-    
-    p_latest, p_prev = (None, None)
-    try:
-        p_latest, p_prev = eia_dry_production_latest_two()
-    except Exception:
-        pass
-    score4, msg4 = production_score(p_latest, p_prev)
-    
-    score5, msg5 = geopolitics_live_score()
-    score6, msg6 = coal_to_gas_switching_live(hh_price)
-    
-    cme_tbl = cme_ng_settlements_table()
-    score7, msg7 = futures_curve_score_from_cme(cme_tbl)
-    
-    score8, msg8 = money_flow_live_placeholder()
-    
-    scores = [score1, score2, score3, score4, score5, score6, score7, score8]
-    active = sum(1 for s in scores if s >= 1)
-    
-    # =============================
-    # UI
-    # =============================
-    if err:
-        st.warning(err)
-    
-    left, right = st.columns([1.2, 1])
-    
-    with left:
-        st.header("1) Price Trend (Live)")
-        if hh_price is None:
-            st.warning("Henry Hub price not available right now.")
-        else:
-            st.success(f"Henry Hub (daily): {hh_price:.2f}")
-            st.write("Last values:", ", ".join([f"{x:.2f}" for x in last5]))
-        if score1 == 2:
-            st.success(msg1)
-        elif score1 == 1:
-            st.info(msg1)
-        else:
-            st.warning(msg1)
-    
-        st.header("2) Weather / HDD Strength (Live)")
-        if score2 == 2:
-            st.success(msg2)
-        elif score2 == 1:
-            st.info(msg2)
-        else:
-            st.warning(msg2)
-    
-        st.header("3) Storage (Live)")
-        if s_latest is not None and s_prev is not None:
-            st.write(f"Latest storage: {s_latest:,.0f} Bcf | Previous: {s_prev:,.0f} Bcf")
-        if score3 == 2:
-            st.success(msg3)
-        elif score3 == 1:
-            st.info(msg3)
-        else:
-            st.warning(msg3)
-    
-        st.header("4) Production (Live proxy)")
-        if p_latest is not None and p_prev is not None:
-            st.write(f"Latest: {p_latest:,.0f} | Previous: {p_prev:,.0f}")
-        if score4 == 2:
-            st.success(msg4)
-        elif score4 == 1:
-            st.info(msg4)
-        else:
-            st.warning(msg4)
-    
-    with right:
-        st.header("5) Geopolitics (Live)")
-        (st.success if score5 >= 1 else st.info)(msg5)
-    
-        st.header("6) Coal to Gas Switching (Official Live)")
-        if score6 == 2:
-            st.success(msg6)
-        elif score6 == 1:
-            st.info(msg6)
-        else:
-            st.warning(msg6)
-    
-        st.header("7) Futures Curve (Official Live - CME Settlements)")
-        if cme_tbl is None:
-            st.info("CME settlements table not reachable right now.")
-        else:
-            st.dataframe(cme_tbl.head(12), use_container_width=True)
-        if score7 == 2:
-            st.success(msg7)
-        elif score7 == 1:
-            st.info(msg7)
-        else:
-            st.warning(msg7)
-    
-        st.header("8) Money Flow (Official Live - Weekly CFTC COT)")
-        st.info(msg8)
-    
-    st.divider()
-    st.header("Overall Bullish Score (Live: 1–8)")
-    st.subheader(f"{active} / 8")
-    
-    if active >= threshold:
-        st.sidebar.success(f"ALERT ✅ Score {active}/8 reached!")
-        st.warning(f"ALERT ✅ Score {active}/8 reached! Conditions strong.")
-    
-    if active >= 6:
-        st.success("Strong bullish environment (official live).")
-    elif active >= 4:
-        st.info("Mixed / Neutral (official live).")
-    else:
-        st.warning("Not supportive right now (official live).")
-    
-    # Do auto-refresh at the very end so UI renders first
-    if do_autorefresh:
-        time.sleep(refresh_mins * 60)
-        st.rerun()
-
-
 # Optional RSS news feeds
 try:
     import feedparser
@@ -695,46 +240,31 @@ def compute_vwap_and_levels(intra: pd.DataFrame) -> dict:
 # Helpers
 # -----------------------------
 
-# --- EIA forecast storage (for correct Surprise: Actual - Forecast for the SAME report week)
-_FORECAST_STORE = Path("eia_forecasts.json")
+# --- EIA forecast storage (STREAMLIT CLOUD SAFE: uses session_state only)
+# Streamlit Community Cloud filesystem is ephemeral/read-only across restarts.
+# So we store forecasts in st.session_state (persists across reruns/tabs in the same browser session).
 
-def _load_eia_forecasts() -> dict:
-    try:
-        if _FORECAST_STORE.exists():
-            return json.loads(_FORECAST_STORE.read_text())
-    except Exception:
-        pass
-    return {}
+def _get_forecast_store() -> dict:
+    import streamlit as st
+    if "eia_forecast_by_date" not in st.session_state or not isinstance(st.session_state["eia_forecast_by_date"], dict):
+        st.session_state["eia_forecast_by_date"] = {}
+    return st.session_state["eia_forecast_by_date"]
 
-def _save_eia_forecasts(data: dict) -> None:
-    try:
-        _FORECAST_STORE.write_text(json.dumps(data, indent=2))
-    except Exception:
-        # If write fails (read-only env), fall back to session_state
-        st.session_state["_eia_forecasts_fallback"] = data
-
-def _get_saved_forecast(report_date: dt.date) -> float | None:
+def _get_saved_forecast(report_date):
+    # report_date: dt.date
+    store = _get_forecast_store()
     key = report_date.isoformat()
-    data = _load_eia_forecasts()
-    if key in data:
-        try:
-            return float(data[key])
-        except Exception:
-            return None
-    # fallback
-    fb = st.session_state.get("_eia_forecasts_fallback", {})
-    if isinstance(fb, dict) and key in fb:
-        try:
-            return float(fb[key])
-        except Exception:
-            return None
-    return None
+    val = store.get(key)
+    try:
+        return float(val) if val is not None else None
+    except Exception:
+        return None
 
-def _set_saved_forecast(report_date: dt.date, forecast_bcf: float) -> None:
-    key = report_date.isoformat()
-    data = _load_eia_forecasts()
-    data[key] = float(forecast_bcf)
-    _save_eia_forecasts(data)
+def _set_saved_forecast(report_date, forecast_bcf: float) -> None:
+    store = _get_forecast_store()
+    store[report_date.isoformat()] = float(forecast_bcf)
+
+
 def fetch_eia_storage_us_total(api_key):
     """
     Fetch latest US working gas in storage (BCF)
@@ -1407,7 +937,7 @@ def main():
         next_report_date_sidebar = estimate_next_eia_report_date(dt.date.today())
         saved_fc_sidebar = _get_saved_forecast(next_report_date_sidebar)
         if "eia_market_forecast_bcf" not in st.session_state:
-            st.session_state["eia_market_forecast_bcf"] = float(saved_fc_sidebar) if saved_fc_sidebar is not None else -107.0
+            st.session_state["eia_market_forecast_bcf"] = float(saved_fc_sidebar) if saved_fc_sidebar is not None else -89.0
 
         eia_market_forecast_bcf = st.number_input(
             "Next EIA report market forecast (BCF)",
@@ -2035,19 +1565,11 @@ def main():
         except Exception as e:
             st.warning(f"Power burn fetch failed: {e}")
 
-    tabs = st.tabs(['🌍 Worldwide Bullish Dashboard', 'NG Drivers + Auto Signal', 'GWDD Dashboard', 'EIA Storage Dashboard', 'Signals & Summary', 'Contracts & Rollover', 'NG News'])
-
-    # -----------------------------
-    # Tab 0: Worldwide Bullish Dashboard (NEW)
-    # -----------------------------
-    with tabs[0]:
-        render_bullish_dashboard()
-
-
+    tabs = st.tabs(['NG Drivers + Auto Signal', 'GWDD Dashboard', 'EIA Storage Dashboard', 'Signals & Summary', 'Contracts & Rollover', 'NG News'])
     # -----------------------------
     # Tab 1: GWDD
     # -----------------------------
-    with tabs[2]:
+    with tabs[1]:
         st.subheader("GWDD (City-wise + Overall Weighted)")
 
         if cities_df.empty:
@@ -2218,7 +1740,7 @@ def main():
                     st.info("Global GWDD: No data returned (check internet).")
 
     # -----------------------------
-    with tabs[3]:
+    with tabs[2]:
         st.subheader("EIA Weekly Natural Gas Storage (BCF) + Weekly Injection/Withdrawal")
 
         st.markdown("### EIA storage report (forecast + actual)")
@@ -2753,7 +2275,7 @@ def main():
         return out
 
 
-    with tabs[4]:
+    with tabs[3]:
         st.header("Signals & Summary")
         st.divider()
 
@@ -3071,7 +2593,7 @@ def main():
     # -----------------------------
     # Tab 4: Contracts & Rollover
     # -----------------------------
-    with tabs[5]:
+    with tabs[4]:
 
         # Holiday set for more accurate rollover estimates (major US holidays + Good Friday)
         years = list(range(dt.date.today().year - 1, dt.date.today().year + 3))
@@ -3242,7 +2764,7 @@ def main():
     # -----------------------------
     # Tab 5: NG News
     # -----------------------------
-    with tabs[6]:
+    with tabs[5]:
         st.subheader("📰 Natural Gas News (Headlines)")
         st.caption("Headlines only (opens sources in a new tab).")
 
@@ -3444,7 +2966,7 @@ def main():
             sig = "Neutral"
         return sig, score
 
-    with tabs[1]:
+    with tabs[0]:
         st.header("NG Drivers + Auto Signal")
 
         auto_refresh = st.checkbox("Auto-refresh every 60 seconds", value=False)
