@@ -36,6 +36,7 @@ except Exception:
 # Small local stores (persist simple "yesterday" values)
 # -----------------------------
 _GWDD_STORE = Path("gwdd_daily_store.json")
+_EIA_FORECAST_STORE = Path("eia_forecast_store.json")
 
 
 def _load_json_store(p: Path) -> dict:
@@ -244,25 +245,31 @@ def compute_vwap_and_levels(intra: pd.DataFrame) -> dict:
 # Streamlit Community Cloud filesystem is ephemeral/read-only across restarts.
 # So we store forecasts in st.session_state (persists across reruns/tabs in the same browser session).
 
-def _get_forecast_store() -> dict:
-    import streamlit as st
-    if "eia_forecast_by_date" not in st.session_state or not isinstance(st.session_state["eia_forecast_by_date"], dict):
-        st.session_state["eia_forecast_by_date"] = {}
-    return st.session_state["eia_forecast_by_date"]
+def _load_eia_forecast_store() -> dict:
+    try:
+        if _EIA_FORECAST_STORE.exists():
+            return json.loads(_EIA_FORECAST_STORE.read_text())
+    except Exception:
+        pass
+    return {}
+
+def _save_eia_forecast_store(data: dict) -> None:
+    try:
+        _EIA_FORECAST_STORE.write_text(json.dumps(data, indent=2))
+    except Exception:
+        pass
 
 def _get_saved_forecast(report_date):
-    # report_date: dt.date
-    store = _get_forecast_store()
-    key = report_date.isoformat()
-    val = store.get(key)
+    store = _load_eia_forecast_store()
     try:
-        return float(val) if val is not None else None
+        return float(store.get(report_date.isoformat()))
     except Exception:
         return None
 
 def _set_saved_forecast(report_date, forecast_bcf: float) -> None:
-    store = _get_forecast_store()
+    store = _load_eia_forecast_store()
     store[report_date.isoformat()] = float(forecast_bcf)
+    _save_eia_forecast_store(store)
 
 
 def fetch_eia_storage_us_total(api_key):
@@ -936,8 +943,11 @@ def main():
         # IMPORTANT: persist value across refresh AND reload saved value after restart.
         next_report_date_sidebar = estimate_next_eia_report_date(dt.date.today())
         saved_fc_sidebar = _get_saved_forecast(next_report_date_sidebar)
-        if "eia_market_forecast_bcf" not in st.session_state:
-            st.session_state["eia_market_forecast_bcf"] = float(saved_fc_sidebar) if saved_fc_sidebar is not None else -89.0
+        # Always sync input with latest saved forecast
+        if saved_fc_sidebar is not None:
+            st.session_state["eia_market_forecast_bcf"] = float(saved_fc_sidebar)
+        elif "eia_market_forecast_bcf" not in st.session_state:
+            st.session_state["eia_market_forecast_bcf"] = -89.0
 
         eia_market_forecast_bcf = st.number_input(
             "Next EIA report market forecast (BCF)",
@@ -1061,16 +1071,20 @@ def main():
         yy = str(delivery_year)[-2:]
         return f"NG{_MONTH_CODE[delivery_month]}{yy}"
 
-    def front_delivery_month(today: "dt.date") -> tuple[int,int]:
-        # Choose the nearest delivery month that has not expired yet.
+    def front_delivery_month(today: dt.date) -> tuple[int, int]:
+        """
+        Always skip contracts that are close to expiry (prevents fake backwardation).
+        """
         y, m = today.year, today.month
         exp = ng_contract_expiry(y, m)
-        if today <= exp:
-            return y, m
-        # else next month
-        if m == 12:
-            return y+1, 1
-        return y, m+1
+
+        # If within 10 days of expiry, force next month
+        if (exp - today).days <= 10:
+            if m == 12:
+                return y + 1, 1
+            return y, m + 1
+
+        return y, m
 
 
     # ==============================
